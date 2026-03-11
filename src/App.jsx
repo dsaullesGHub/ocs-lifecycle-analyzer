@@ -282,6 +282,139 @@ function FilterBar({ filters, setFilters, lifecycles }) {
   );
 }
 
+// ── Opportunities Engine ──────────────────────────────────────────────────────
+
+function computeOpportunities(lifecycles, rates) {
+  const opps = [];
+
+  // 1. Short-dwell pallets (<=7 days) - why was this in OCS?
+  const shortDwell = lifecycles.filter(lc => !lc.preExisting && !lc.open && lc.dwell != null && lc.dwell <= 7);
+  if (shortDwell.length > 0) {
+    const costWasted = shortDwell.reduce((s, lc) => s + (lc.totalCost || 0), 0);
+    const byLoc = {};
+    for (const lc of shortDwell) { byLoc[lc.loc] = (byLoc[lc.loc] || 0) + 1; }
+    opps.push({
+      id: "short-dwell", severity: "high", category: "Avoidable Cost",
+      title: `${shortDwell.length.toLocaleString()} pallets left OCS within 7 days`,
+      subtitle: "Product that enters and exits within a week may not need outside storage. Each pallet incurs full handling + initial storage charges regardless of dwell time.",
+      metric: costWasted, metricLabel: "handling + storage charged",
+      detail: shortDwell, byLoc,
+      recommendation: "Evaluate whether these materials could ship direct from F7 or use a cross-dock arrangement to avoid the initial storage charge.",
+    });
+  }
+
+  // 2. Pallets crossing renewal thresholds by 1-3 days
+  const nearMiss = lifecycles.filter(lc => !lc.preExisting && !lc.open && lc.dwell != null && lc.renewalCycles > 0 && (lc.dwell % (rates[lc.loc]?.cycleDays || 30)) <= 3);
+  if (nearMiss.length > 0) {
+    const extraCost = nearMiss.reduce((s, lc) => s + (rates[lc.loc]?.renewalStorage || 0), 0);
+    opps.push({
+      id: "cycle-threshold", severity: "medium", category: "Timing Optimization",
+      title: `${nearMiss.length.toLocaleString()} pallets crossed a renewal cycle by 1-3 days`,
+      subtitle: "These pallets triggered an additional 30-day storage cycle because they stayed just slightly past the threshold. Earlier pull could have avoided the renewal charge.",
+      metric: extraCost, metricLabel: "in avoidable renewal charges",
+      detail: nearMiss, byLoc: {},
+      recommendation: "Prioritize pull-forward on pallets approaching cycle boundaries. A 2-3 day earlier shipment would save the full renewal fee per pallet.",
+    });
+  }
+
+  // 3. Stale open inventory (>90 days)
+  const stale = lifecycles.filter(lc => lc.open && !lc.preExisting && lc.dwell > 90);
+  if (stale.length > 0) {
+    const staleCost = stale.reduce((s, lc) => s + (lc.totalCost || 0), 0);
+    const byMat = {};
+    for (const lc of stale) { byMat[lc.material] = (byMat[lc.material] || 0) + 1; }
+    opps.push({
+      id: "stale-inventory", severity: "high", category: "Inventory Velocity",
+      title: `${stale.length.toLocaleString()} open pallets with 90+ day dwell`,
+      subtitle: "Industry benchmark for frozen distribution is 30-45 day average dwell. Pallets beyond 90 days are accumulating renewal cycles and may indicate demand planning gaps.",
+      metric: staleCost, metricLabel: "accrued cost on stale pallets",
+      detail: stale, byLoc: {},
+      recommendation: "Review materials with high stale counts. Consider markdown, reallocation, or write-off to stop the renewal bleed.",
+      topMaterials: Object.entries(byMat).sort((a, b) => b[1] - a[1]).slice(0, 10),
+    });
+  }
+
+  // 4. Vendor cost comparison - same material at different locations
+  const matLocs = {};
+  for (const lc of lifecycles.filter(l => !l.preExisting && l.dwell != null && l.hasRates)) {
+    if (!matLocs[lc.material]) matLocs[lc.material] = {};
+    if (!matLocs[lc.material][lc.loc]) matLocs[lc.material][lc.loc] = { count: 0, totalCost: 0, dwells: [] };
+    matLocs[lc.material][lc.loc].count++;
+    matLocs[lc.material][lc.loc].totalCost += lc.totalCost;
+    matLocs[lc.material][lc.loc].dwells.push(lc.dwell);
+  }
+  const multiLocMats = Object.entries(matLocs).filter(([, locs]) => Object.keys(locs).length > 1);
+  if (multiLocMats.length > 0) {
+    const comparisons = multiLocMats.map(([mat, locs]) => {
+      const entries = Object.entries(locs).map(([loc, d]) => ({
+        loc, count: d.count, avgCost: d.totalCost / d.count, avgDwell: d.dwells.reduce((a, b) => a + b, 0) / d.dwells.length,
+      })).sort((a, b) => a.avgCost - b.avgCost);
+      const savings = entries.length >= 2 ? (entries[entries.length - 1].avgCost - entries[0].avgCost) * entries[entries.length - 1].count : 0;
+      return { material: mat, entries, savings };
+    }).filter(c => c.savings > 100).sort((a, b) => b.savings - a.savings);
+
+    if (comparisons.length > 0) {
+      opps.push({
+        id: "vendor-arbitrage", severity: "medium", category: "Vendor Optimization",
+        title: `${comparisons.length} materials stored at multiple locations with cost variance`,
+        subtitle: "Same product stored at different vendors incurs different costs per pallet. Consolidating to the lower-cost location where operationally feasible reduces total spend.",
+        metric: comparisons.reduce((s, c) => s + c.savings, 0), metricLabel: "potential savings from consolidation",
+        comparisons: comparisons.slice(0, 15),
+      });
+    }
+  }
+
+  // 5. Forward cost projection on open inventory
+  const openPallets = lifecycles.filter(lc => lc.open && !lc.preExisting && lc.dwell != null);
+  if (openPallets.length > 0) {
+    const projections = [30, 60, 90].map(days => {
+      let projCost = 0;
+      for (const lc of openPallets) {
+        const r = rates[lc.loc]; if (!r || !lc.hasRates) continue;
+        const futureDwell = lc.dwell + days;
+        const futureCycles = Math.max(0, Math.ceil(futureDwell / (r.cycleDays || 30)) - 1);
+        const futureTotal = r.handling + r.initialStorage + futureCycles * r.renewalStorage;
+        projCost += futureTotal;
+      }
+      return { days, cost: projCost, delta: projCost - openPallets.reduce((s, lc) => s + (lc.totalCost || 0), 0) };
+    });
+    const currentCost = openPallets.reduce((s, lc) => s + (lc.totalCost || 0), 0);
+    opps.push({
+      id: "forward-projection", severity: "info", category: "Cost Projection",
+      title: `${openPallets.length.toLocaleString()} open pallets accruing storage`,
+      subtitle: "If current open inventory stays in OCS storage, here is the projected cost trajectory.",
+      metric: currentCost, metricLabel: "current accrued cost",
+      projections, palletCount: openPallets.length,
+    });
+  }
+
+  // 6. Dwell benchmarking by location
+  const benchmarks = [];
+  for (const loc of Object.keys(OCS_LOCATIONS)) {
+    const locLCs = lifecycles.filter(lc => lc.loc === loc && !lc.preExisting && lc.dwell != null && !lc.open);
+    if (locLCs.length < 10) continue;
+    const dwells = locLCs.map(lc => lc.dwell).sort((a, b) => a - b);
+    const median = dwells[Math.floor(dwells.length / 2)];
+    const p90 = dwells[Math.floor(dwells.length * 0.9)];
+    const under30 = dwells.filter(d => d <= 30).length;
+    const over60 = dwells.filter(d => d > 60).length;
+    benchmarks.push({ loc, name: OCS_LOCATIONS[loc]?.name, median, p90, total: dwells.length, under30, under30Pct: (under30 / dwells.length * 100).toFixed(1), over60, over60Pct: (over60 / dwells.length * 100).toFixed(1) });
+  }
+  if (benchmarks.length > 0) {
+    opps.push({
+      id: "dwell-benchmark", severity: "info", category: "Benchmarking",
+      title: "Dwell time benchmarks by location",
+      subtitle: "Industry target for frozen distribution: median dwell under 30 days, 90th percentile under 60 days. Locations exceeding these thresholds have inventory velocity issues.",
+      benchmarks: benchmarks.sort((a, b) => b.median - a.median),
+    });
+  }
+
+  return opps.sort((a, b) => {
+    const sev = { high: 0, medium: 1, info: 2 };
+    return (sev[a.severity] || 9) - (sev[b.severity] || 9);
+  });
+}
+
 export default function App() {
   const [loadedFiles, setLoadedFiles] = useState([]);
   const [rawTx, setRawTx] = useState([]);
@@ -295,11 +428,13 @@ export default function App() {
   const [drillMat, setDrillMat] = useState(null);
   const [drillLoc, setDrillLoc] = useState(null);
   const [ohGran, setOhGran] = useState("week");
-  const [savedProject, setSavedProject] = useState(undefined); // undefined=checking, null=none, object=found
+  const [savedProject, setSavedProject] = useState(undefined);
   const [lastSaved, setLastSaved] = useState(null);
+  const [dragging, setDragging] = useState(false);
   const fileRef = useRef(null);
   const addRef = useRef(null);
   const importRef = useRef(null);
+  const dropRef = useRef(null);
 
   // Check for saved project on mount
   useEffect(() => {
@@ -444,14 +579,40 @@ export default function App() {
                 <div style={{ width: 24, height: 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: ld ? CV.green : CV.creamDark, color: ld ? "#fff" : "#999", fontSize: 12, fontWeight: 800 }}>{ld ? "\u2713" : "\u2022"}</div>
                 <div><div style={{ fontSize: 13, fontWeight: 600, color: ld ? CV.navy : "#999", fontFamily: "monospace" }}>{fn}</div>{ld && <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{ld.rows.toLocaleString()} rows, {ld.txCount.toLocaleString()} OCS txns</div>}</div>
               </div>); })}
+
+            {/* Drag and drop zone */}
+            <div ref={dropRef}
+              onDragOver={e => { e.preventDefault(); e.stopPropagation(); setDragging(true); }}
+              onDragEnter={e => { e.preventDefault(); e.stopPropagation(); setDragging(true); }}
+              onDragLeave={e => { e.preventDefault(); e.stopPropagation(); setDragging(false); }}
+              onDrop={e => {
+                e.preventDefault(); e.stopPropagation(); setDragging(false);
+                const files = e.dataTransfer.files;
+                // Check if it's a JSON project file
+                if (files.length === 1 && files[0].name.endsWith(".json")) { handleImport(files); }
+                else { addFile(files, false); }
+              }}
+              style={{
+                marginTop: 16, padding: "24px 16px", borderRadius: 10,
+                border: `2px dashed ${dragging ? CV.teal : CV.creamDark}`,
+                background: dragging ? "rgba(0,163,190,0.05)" : "transparent",
+                textAlign: "center", cursor: "pointer", transition: "all 0.2s",
+              }}
+              onClick={() => fileRef.current?.click()}
+            >
+              <div style={{ fontSize: 24, marginBottom: 8, opacity: 0.4 }}>{dragging ? "\u2B07" : "\u{1F4C1}"}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: dragging ? CV.teal : CV.navy }}>
+                {dragging ? "Drop files here" : "Drag and drop WMS files here"}
+              </div>
+              <div style={{ fontSize: 11, color: "#999", marginTop: 4 }}>or click to browse. Select multiple files at once.</div>
+            </div>
           </Card>
           {loadedFiles.length > 0 && <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>{[{ l: "Files", v: loadedFiles.length }, { l: "Rows", v: loadedFiles.reduce((s, f) => s + f.rows, 0).toLocaleString() }, { l: "OCS Txns", v: rawTx.length.toLocaleString() }].map(s => <div key={s.l} style={{ flex: 1, background: CV.navyLight, borderRadius: 10, padding: "12px 16px", textAlign: "center" }}><div style={{ fontSize: 22, fontWeight: 800, color: CV.navy }}>{s.v}</div><div style={{ fontSize: 10, color: "#888", fontWeight: 600 }}>{s.l.toUpperCase()}</div></div>)}</div>}
           <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
-            <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => { addFile(e.target.files, false); e.target.value = ""; }} />
-            <button onClick={() => fileRef.current?.click()} disabled={processing} style={{ padding: "12px 28px", borderRadius: 10, border: "none", cursor: processing ? "default" : "pointer", fontSize: 14, fontWeight: 700, color: "#fff", background: processing ? "#999" : CV.navy }}>{processing ? "Processing..." : loadedFiles.length === 0 ? "Load WMS File" : "Add Next File"}</button>
+            <input ref={fileRef} type="file" accept=".xlsx,.xls" multiple style={{ display: "none" }} onChange={e => { addFile(e.target.files, false); e.target.value = ""; }} />
 
             <input ref={importRef} type="file" accept=".json" style={{ display: "none" }} onChange={e => { handleImport(e.target.files); e.target.value = ""; }} />
-            <button onClick={() => importRef.current?.click()} disabled={processing} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: processing ? "default" : "pointer", fontSize: 13, fontWeight: 600, color: CV.navy, background: "#fff" }}>Import Project</button>
+            <button onClick={() => importRef.current?.click()} disabled={processing} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: processing ? "default" : "pointer", fontSize: 13, fontWeight: 600, color: CV.navy, background: "#fff" }}>Import Project (.json)</button>
 
             {loadedFiles.length > 0 && !processing && <button onClick={reset} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#999", background: "#fff" }}>Start Over</button>}
           </div>
@@ -462,7 +623,8 @@ export default function App() {
     );
   }
 
-  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
+  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
+  const oppsData = useMemo(() => costed ? computeOpportunities(costed, rates) : [], [costed, rates]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream, color: CV.navy }}>
@@ -473,7 +635,7 @@ export default function App() {
           <span style={{ fontSize: 10, color: "rgba(255,255,255,0.4)" }}>{loadedFiles.length} files | {fmtN(totals.pallets)} lifecycles</span>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
-          <input ref={addRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => { addFile(e.target.files, true); e.target.value = ""; }} />
+          <input ref={addRef} type="file" accept=".xlsx,.xls" multiple style={{ display: "none" }} onChange={e => { addFile(e.target.files, true); e.target.value = ""; }} />
           <button onClick={() => addRef.current?.click()} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>+ File</button>
           <button onClick={() => exportCSV(filtered)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>CSV</button>
           <button onClick={() => exportProjectFile(rawTx, loadedFiles, rates)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>Save Project</button>
@@ -535,6 +697,137 @@ export default function App() {
             <Card style={{ flex: "2 0 400px" }}><SectionTitle>Distribution</SectionTitle><ResponsiveContainer width="100%" height={250}><BarChart data={agData.filter(b => b.count > 0)} layout="vertical"><CartesianGrid strokeDasharray="3 3" stroke={CV.creamDark} /><XAxis type="number" tick={{ fontSize: 10 }} /><YAxis dataKey="label" type="category" tick={{ fontSize: 10 }} width={80} /><Tooltip /><Bar dataKey="count" name="Pallets">{agData.filter(b => b.count > 0).map((b, i) => <Cell key={i} fill={b.color} />)}</Bar></BarChart></ResponsiveContainer></Card>
             <Card style={{ flex: "1 0 250px" }}><SectionTitle>Summary</SectionTitle><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}><thead><tr style={{ borderBottom: `2px solid ${CV.creamDark}` }}>{["Bucket", "Plts", "Cost"].map(h => <th key={h} style={{ padding: "6px 8px", textAlign: h === "Bucket" ? "left" : "right", fontWeight: 700, fontSize: 10, color: CV.navy }}>{h}</th>)}</tr></thead><tbody>{agData.map(b => <tr key={b.label} style={{ borderBottom: `1px solid ${CV.cream}`, opacity: b.count === 0 ? 0.3 : 1 }}><td style={{ padding: "6px 8px" }}><span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: b.color, marginRight: 6 }} />{b.label}</td><td style={{ padding: "6px 8px", textAlign: "right", fontWeight: 700 }}>{fmtN(b.count)}</td><td style={{ padding: "6px 8px", textAlign: "right", fontFamily: "monospace" }}>{b.cost > 0 ? fmt$(b.cost) : "---"}</td></tr>)}<tr style={{ background: CV.navyLight, fontWeight: 700 }}><td style={{ padding: "8px" }}>Total</td><td style={{ padding: "8px", textAlign: "right" }}>{fmtN(agData.reduce((s, b) => s + b.count, 0))}</td><td style={{ padding: "8px", textAlign: "right", fontFamily: "monospace" }}>{fmt$(agData.reduce((s, b) => s + b.cost, 0))}</td></tr></tbody></table></Card>
           </div>
+        </>}
+
+        {tab === "opportunities" && <>
+          <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 800 }}>Opportunities and Benchmarking</h2>
+          <p style={{ margin: "0 0 20px", fontSize: 12, color: "#888", lineHeight: 1.5 }}>
+            Automated analysis of waste patterns, cost avoidance opportunities, and benchmarks against industry standards.
+            {oppsData.length > 0 && ` ${oppsData.filter(o => o.severity === "high").length} high-priority items identified.`}
+          </p>
+
+          {oppsData.map(opp => {
+            const sevColors = { high: { bg: "#FEEEEC", border: CV.red, badge: CV.red }, medium: { bg: "#FEF3E2", border: CV.orange, badge: CV.orange }, info: { bg: CV.navyLight, border: CV.navy, badge: CV.teal } };
+            const sc = sevColors[opp.severity] || sevColors.info;
+            return (
+              <Card key={opp.id} style={{ marginBottom: 16, borderLeft: `4px solid ${sc.border}` }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                  <Badge bg={sc.bg} color={sc.badge}>{opp.severity.toUpperCase()}</Badge>
+                  <Badge bg={CV.navyLight} color={CV.navy}>{opp.category}</Badge>
+                </div>
+                <h3 style={{ margin: "0 0 6px", fontSize: 15, fontWeight: 700, color: CV.navy }}>{opp.title}</h3>
+                <p style={{ margin: "0 0 12px", fontSize: 12, color: "#666", lineHeight: 1.6 }}>{opp.subtitle}</p>
+
+                {opp.metric != null && (
+                  <div style={{ display: "inline-flex", alignItems: "baseline", gap: 6, background: sc.bg, padding: "8px 14px", borderRadius: 8, marginBottom: 12 }}>
+                    <span style={{ fontSize: 20, fontWeight: 800, color: sc.badge, fontFamily: "monospace" }}>{fmt$(opp.metric)}</span>
+                    <span style={{ fontSize: 11, color: "#888" }}>{opp.metricLabel}</span>
+                  </div>
+                )}
+
+                {opp.recommendation && (
+                  <div style={{ background: CV.cream, borderRadius: 8, padding: "10px 14px", marginBottom: 12 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: CV.navy, textTransform: "uppercase", marginBottom: 4 }}>Recommendation</div>
+                    <div style={{ fontSize: 12, color: CV.navy, lineHeight: 1.5 }}>{opp.recommendation}</div>
+                  </div>
+                )}
+
+                {/* Short dwell breakdown */}
+                {opp.id === "short-dwell" && opp.byLoc && (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+                    {Object.entries(opp.byLoc).sort((a, b) => b[1] - a[1]).map(([loc, cnt]) => (
+                      <div key={loc} style={{ background: "#fff", border: `1px solid ${CV.creamDark}`, borderRadius: 6, padding: "6px 10px" }}>
+                        <span style={{ fontFamily: "monospace", fontWeight: 700, marginRight: 4 }}>{loc}</span>
+                        <span style={{ fontSize: 11, color: "#888" }}>{cnt} pallets</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Stale inventory top materials */}
+                {opp.id === "stale-inventory" && opp.topMaterials && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: CV.navy, marginBottom: 6 }}>Top Materials (by stale pallet count)</div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {opp.topMaterials.map(([mat, cnt]) => (
+                        <div key={mat} style={{ background: "#fff", border: `1px solid ${CV.creamDark}`, borderRadius: 6, padding: "4px 8px", cursor: "pointer" }} onClick={() => { setDrillMat(mat); setTab("materials"); }}>
+                          <span style={{ fontFamily: "monospace", fontWeight: 600, fontSize: 11, marginRight: 4 }}>{mat}</span>
+                          <span style={{ fontSize: 10, color: CV.red }}>{cnt}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Vendor cost comparisons */}
+                {opp.id === "vendor-arbitrage" && opp.comparisons && (
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                      <thead><tr style={{ borderBottom: `2px solid ${CV.creamDark}` }}>{["Material", "Cheapest Loc", "$/Plt", "Expensive Loc", "$/Plt", "Potential Savings"].map(h => <th key={h} style={{ padding: "6px 8px", textAlign: "left", fontWeight: 700, fontSize: 10, color: CV.navy }}>{h}</th>)}</tr></thead>
+                      <tbody>{opp.comparisons.slice(0, 10).map((c, i) => (
+                        <tr key={c.material} style={{ borderBottom: `1px solid ${CV.cream}` }}>
+                          <td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{c.material}</td>
+                          <td style={{ padding: "5px 8px", color: CV.green }}>{c.entries[0].loc} ({OCS_LOCATIONS[c.entries[0].loc]?.name})</td>
+                          <td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{fmt$(c.entries[0].avgCost)}</td>
+                          <td style={{ padding: "5px 8px", color: CV.red }}>{c.entries[c.entries.length - 1].loc} ({OCS_LOCATIONS[c.entries[c.entries.length - 1].loc]?.name})</td>
+                          <td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{fmt$(c.entries[c.entries.length - 1].avgCost)}</td>
+                          <td style={{ padding: "5px 8px", fontWeight: 700, fontFamily: "monospace", color: CV.green }}>{fmt$(c.savings)}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* Forward cost projection */}
+                {opp.id === "forward-projection" && opp.projections && (
+                  <div>
+                    <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+                      {opp.projections.map(p => (
+                        <div key={p.days} style={{ flex: "1 0 140px", background: "#fff", border: `1px solid ${CV.creamDark}`, borderRadius: 8, padding: "12px 14px" }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: "#888", textTransform: "uppercase", marginBottom: 4 }}>If held {p.days} more days</div>
+                          <div style={{ fontSize: 18, fontWeight: 800, color: CV.red, fontFamily: "monospace" }}>{fmtK(p.cost)}</div>
+                          <div style={{ fontSize: 10, color: CV.orange }}>+{fmtK(p.delta)} from today</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#888" }}>{opp.palletCount.toLocaleString()} open pallets included in projection. Assumes no additional entries or exits.</div>
+                  </div>
+                )}
+
+                {/* Dwell benchmarks */}
+                {opp.id === "dwell-benchmark" && opp.benchmarks && (
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <thead><tr style={{ borderBottom: `2px solid ${CV.creamDark}` }}>{["Code", "Location", "Median Dwell", "90th %ile", "Under 30d", "Over 60d", "Assessment"].map(h => <th key={h} style={{ padding: "6px 8px", textAlign: "left", fontWeight: 700, fontSize: 10, color: CV.navy }}>{h}</th>)}</tr></thead>
+                      <tbody>{opp.benchmarks.map(b => {
+                        const good = b.median <= 30; const ok = b.median <= 45;
+                        return (
+                          <tr key={b.loc} style={{ borderBottom: `1px solid ${CV.cream}` }}>
+                            <td style={{ padding: "6px 8px", fontWeight: 800, fontFamily: "monospace" }}>{b.loc}</td>
+                            <td style={{ padding: "6px 8px", fontWeight: 600 }}>{b.name}</td>
+                            <td style={{ padding: "6px 8px", fontWeight: 700, color: good ? CV.green : ok ? CV.orange : CV.red }}>{b.median}d</td>
+                            <td style={{ padding: "6px 8px", fontFamily: "monospace" }}>{b.p90}d</td>
+                            <td style={{ padding: "6px 8px", color: CV.green }}>{b.under30Pct}%</td>
+                            <td style={{ padding: "6px 8px", color: b.over60Pct > 20 ? CV.red : "#888" }}>{b.over60Pct}%</td>
+                            <td style={{ padding: "6px 8px" }}>
+                              <Badge bg={good ? "#E8F8ED" : ok ? "#FEF3E2" : "#FEEEEC"} color={good ? CV.green : ok ? CV.orange : CV.red}>
+                                {good ? "On target" : ok ? "Needs improvement" : "Over benchmark"}
+                              </Badge>
+                            </td>
+                          </tr>
+                        );
+                      })}</tbody>
+                    </table>
+                    <div style={{ marginTop: 12, fontSize: 11, color: "#888", lineHeight: 1.5 }}>
+                      Industry benchmarks for frozen distribution: Median dwell target is under 30 days. 90th percentile should be under 60 days. Over 20% of pallets exceeding 60 days indicates an inventory velocity problem.
+                    </div>
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+
+          {oppsData.length === 0 && <Card><div style={{ padding: "32px", textAlign: "center", color: "#aaa" }}>Load data and build lifecycles to see opportunities.</div></Card>}
         </>}
 
         {tab === "vendors" && <>
