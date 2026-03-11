@@ -1,6 +1,95 @@
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import * as XLSX from "xlsx";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from "recharts";
+
+// ── IndexedDB Persistence ────────────────────────────────────────────────────
+const DB_NAME = "ocs-lifecycle-db";
+const DB_VERSION = 1;
+const STORE_NAME = "projects";
+const CURRENT_KEY = "current";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE_NAME); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveProject(data) {
+  try {
+    const db = await openDB();
+    const serialized = {
+      ...data,
+      rawTx: data.rawTx.map(tx => ({ ...tx, ts: tx.ts.getTime() })),
+      savedAt: Date.now(),
+    };
+    return new Promise((resolve, reject) => {
+      const txn = db.transaction(STORE_NAME, "readwrite");
+      txn.objectStore(STORE_NAME).put(serialized, CURRENT_KEY);
+      txn.oncomplete = () => resolve(true);
+      txn.onerror = () => reject(txn.error);
+    });
+  } catch (e) { console.warn("Save failed:", e); return false; }
+}
+
+async function loadProject() {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const txn = db.transaction(STORE_NAME, "readonly");
+      const req = txn.objectStore(STORE_NAME).get(CURRENT_KEY);
+      req.onsuccess = () => {
+        const data = req.result;
+        if (!data) return resolve(null);
+        resolve({
+          ...data,
+          rawTx: data.rawTx.map(tx => ({ ...tx, ts: new Date(tx.ts) })),
+        });
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) { console.warn("Load failed:", e); return null; }
+}
+
+async function clearProject() {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const txn = db.transaction(STORE_NAME, "readwrite");
+      txn.objectStore(STORE_NAME).delete(CURRENT_KEY);
+      txn.oncomplete = () => resolve(true);
+      txn.onerror = () => reject(txn.error);
+    });
+  } catch (e) { console.warn("Clear failed:", e); return false; }
+}
+
+function exportProjectFile(rawTx, loadedFiles, rates) {
+  const data = {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    loadedFiles,
+    rates,
+    rawTx: rawTx.map(tx => ({ ...tx, ts: tx.ts.getTime() })),
+  };
+  const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `ocs-project-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+}
+
+async function importProjectFile(file) {
+  const text = await file.text();
+  const data = JSON.parse(text);
+  if (!data.rawTx || !data.loadedFiles) throw new Error("Invalid project file");
+  return {
+    loadedFiles: data.loadedFiles,
+    rates: data.rates || { ...DEFAULT_RATES },
+    rawTx: data.rawTx.map(tx => ({ ...tx, ts: new Date(tx.ts) })),
+  };
+}
 
 const CV = { navy: "#2B4170", red: "#E8523F", cream: "#F5EDE0", teal: "#00A3BE", purple: "#7B5EA7", orange: "#F5A623", green: "#4EBC6A", navyLight: "#E8EDF5", creamDark: "#EDE0CE" };
 const LOC_COLORS = [CV.navy, CV.red, CV.teal, CV.purple, CV.orange, CV.green, "#D4619C", "#8B6914", "#3D8B6E", "#AA4444", "#6666AA"];
@@ -206,8 +295,53 @@ export default function App() {
   const [drillMat, setDrillMat] = useState(null);
   const [drillLoc, setDrillLoc] = useState(null);
   const [ohGran, setOhGran] = useState("week");
+  const [savedProject, setSavedProject] = useState(undefined); // undefined=checking, null=none, object=found
+  const [lastSaved, setLastSaved] = useState(null);
   const fileRef = useRef(null);
   const addRef = useRef(null);
+  const importRef = useRef(null);
+
+  // Check for saved project on mount
+  useEffect(() => {
+    loadProject().then(data => {
+      setSavedProject(data || null);
+    }).catch(() => setSavedProject(null));
+  }, []);
+
+  // Auto-save whenever raw transactions or rates change (debounced)
+  const saveTimer = useRef(null);
+  useEffect(() => {
+    if (!rawTx.length || !loadedFiles.length) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      saveProject({ rawTx, loadedFiles, rates }).then(ok => {
+        if (ok) setLastSaved(new Date());
+      });
+    }, 2000);
+    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
+  }, [rawTx, loadedFiles, rates]);
+
+  const restoreSaved = useCallback(() => {
+    if (!savedProject) return;
+    setRawTx(savedProject.rawTx);
+    setLoadedFiles(savedProject.loadedFiles);
+    if (savedProject.rates) setRates(savedProject.rates);
+    setLifecycles(rebuildFromTransactions(savedProject.rawTx, savedProject.rates || rates));
+    setSavedProject(null);
+  }, [savedProject, rates]);
+
+  const handleImport = useCallback(async (fileList) => {
+    const file = fileList[0];
+    if (!file) return;
+    setProcessing(true); setProgress("Importing project...");
+    try {
+      const data = await importProjectFile(file);
+      setRawTx(data.rawTx); setLoadedFiles(data.loadedFiles); setRates(data.rates);
+      setProgress("Building lifecycles..."); await new Promise(r => setTimeout(r, 50));
+      setLifecycles(rebuildFromTransactions(data.rawTx, data.rates));
+      setProgress(""); setProcessing(false);
+    } catch (err) { setProgress(`Import error: ${err.message}`); setProcessing(false); }
+  }, []);
 
   const addFile = useCallback(async (fl, auto = false) => {
     const arr = Array.from(fl).filter(f => f.name.match(/\.xlsx?$/i)); if (!arr.length) return;
@@ -224,7 +358,7 @@ export default function App() {
       setProgress(""); setProcessing(false);
     } catch (err) { setProgress(`Error: ${err.message}`); setProcessing(false); }
   }, [rawTx, loadedFiles, rates]);
-  const reset = useCallback(() => { setLoadedFiles([]); setRawTx([]); setLifecycles(null); setTab("overview"); setProgress(""); setDrillMat(null); setDrillLoc(null); }, []);
+  const reset = useCallback(() => { setLoadedFiles([]); setRawTx([]); setLifecycles(null); setTab("overview"); setProgress(""); setDrillMat(null); setDrillLoc(null); setLastSaved(null); clearProject(); }, []);
 
   const costed = useMemo(() => lifecycles ? computeCosts(lifecycles, rates) : null, [lifecycles, rates]);
   const filtered = useMemo(() => {
@@ -262,16 +396,49 @@ export default function App() {
   // Landing
   if (!lifecycles) {
     const exp = ["WMS_1.xlsx", "WMS_2.xlsx", "WMS_DATA_2026YTD.xlsx"];
+    // Still checking for saved project
+    if (savedProject === undefined) return (
+      <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream }}>
+        <div style={{ fontSize: 13, color: "#888" }}>Loading...</div>
+      </div>
+    );
     return (
       <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream }}>
         <div style={{ maxWidth: 560, width: "100%" }}>
           <div style={{ textAlign: "center", marginBottom: 32 }}>
             <div style={{ fontSize: 10, fontWeight: 700, color: CV.red, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>OCS Platform</div>
             <h1 style={{ margin: "0 0 8px", fontSize: 28, fontWeight: 800, color: CV.navy }}>Pallet Lifecycle Analyzer</h1>
-            <p style={{ margin: 0, fontSize: 13, color: "#888" }}>Load WMS files one at a time.</p>
+            <p style={{ margin: 0, fontSize: 13, color: "#888" }}>Load WMS files, import a saved project, or resume your last session.</p>
           </div>
+
+          {/* Saved project banner */}
+          {savedProject && !loadedFiles.length && (
+            <div style={{ background: "#fff", borderRadius: 12, padding: "20px 24px", border: `2px solid ${CV.green}`, marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                <div style={{ width: 32, height: 32, borderRadius: "50%", background: CV.green, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800 }}>{"\u21BB"}</div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: CV.navy }}>Resume Last Session</div>
+                  <div style={{ fontSize: 11, color: "#888" }}>
+                    {savedProject.loadedFiles.length} file{savedProject.loadedFiles.length !== 1 ? "s" : ""} loaded,{" "}
+                    {savedProject.rawTx.length.toLocaleString()} transactions
+                    {savedProject.savedAt && <span> (saved {new Date(savedProject.savedAt).toLocaleDateString()})</span>}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                {savedProject.loadedFiles.map(f => (
+                  <Badge key={f.name} bg={CV.navyLight} color={CV.navy}>{f.name}</Badge>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={restoreSaved} style={{ padding: "10px 24px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, color: "#fff", background: CV.green }}>Resume</button>
+                <button onClick={() => { setSavedProject(null); clearProject(); }} style={{ padding: "10px 16px", borderRadius: 8, border: `1px solid ${CV.creamDark}`, cursor: "pointer", fontSize: 12, fontWeight: 600, color: "#999", background: "#fff" }}>Discard</button>
+              </div>
+            </div>
+          )}
+
           <Card style={{ marginBottom: 20 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: CV.navy, textTransform: "uppercase", marginBottom: 14 }}>Expected Files</div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: CV.navy, textTransform: "uppercase", marginBottom: 14 }}>Load WMS Files</div>
             {exp.map(fn => { const ld = loadedFiles.find(f => f.name === fn); return (
               <div key={fn} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${CV.cream}` }}>
                 <div style={{ width: 24, height: 24, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: ld ? CV.green : CV.creamDark, color: ld ? "#fff" : "#999", fontSize: 12, fontWeight: 800 }}>{ld ? "\u2713" : "\u2022"}</div>
@@ -279,9 +446,13 @@ export default function App() {
               </div>); })}
           </Card>
           {loadedFiles.length > 0 && <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>{[{ l: "Files", v: loadedFiles.length }, { l: "Rows", v: loadedFiles.reduce((s, f) => s + f.rows, 0).toLocaleString() }, { l: "OCS Txns", v: rawTx.length.toLocaleString() }].map(s => <div key={s.l} style={{ flex: 1, background: CV.navyLight, borderRadius: 10, padding: "12px 16px", textAlign: "center" }}><div style={{ fontSize: 22, fontWeight: 800, color: CV.navy }}>{s.v}</div><div style={{ fontSize: 10, color: "#888", fontWeight: 600 }}>{s.l.toUpperCase()}</div></div>)}</div>}
-          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
             <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => { addFile(e.target.files, false); e.target.value = ""; }} />
-            <button onClick={() => fileRef.current?.click()} disabled={processing} style={{ padding: "12px 28px", borderRadius: 10, border: "none", cursor: processing ? "default" : "pointer", fontSize: 14, fontWeight: 700, color: "#fff", background: processing ? "#999" : CV.navy }}>{processing ? "Processing..." : loadedFiles.length === 0 ? "Load First File" : "Add Next File"}</button>
+            <button onClick={() => fileRef.current?.click()} disabled={processing} style={{ padding: "12px 28px", borderRadius: 10, border: "none", cursor: processing ? "default" : "pointer", fontSize: 14, fontWeight: 700, color: "#fff", background: processing ? "#999" : CV.navy }}>{processing ? "Processing..." : loadedFiles.length === 0 ? "Load WMS File" : "Add Next File"}</button>
+
+            <input ref={importRef} type="file" accept=".json" style={{ display: "none" }} onChange={e => { handleImport(e.target.files); e.target.value = ""; }} />
+            <button onClick={() => importRef.current?.click()} disabled={processing} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: processing ? "default" : "pointer", fontSize: 13, fontWeight: 600, color: CV.navy, background: "#fff" }}>Import Project</button>
+
             {loadedFiles.length > 0 && !processing && <button onClick={reset} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#999", background: "#fff" }}>Start Over</button>}
           </div>
           {progress && <div style={{ marginTop: 16, padding: "12px 16px", background: CV.navyLight, borderRadius: 8, fontSize: 12, color: CV.navy, textAlign: "center" }}>{progress}</div>}
@@ -305,7 +476,9 @@ export default function App() {
           <input ref={addRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={e => { addFile(e.target.files, true); e.target.value = ""; }} />
           <button onClick={() => addRef.current?.click()} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>+ File</button>
           <button onClick={() => exportCSV(filtered)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>CSV</button>
+          <button onClick={() => exportProjectFile(rawTx, loadedFiles, rates)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>Save Project</button>
           <button onClick={reset} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,0.5)", background: "transparent" }}>Reset</button>
+          {lastSaved && <span style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", alignSelf: "center" }}>auto-saved {lastSaved.toLocaleTimeString()}</span>}
         </div>
       </div>
       <div style={{ background: "#fff", padding: "0 24px", borderBottom: `1px solid ${CV.creamDark}`, display: "flex", gap: 0, overflowX: "auto", flexShrink: 0 }}>
