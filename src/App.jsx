@@ -167,10 +167,19 @@ function computeCosts(lifecycles, rates) {
 
 async function parseFileToTransactions(file, setProgress) {
   const transactions = []; let totalRows = 0;
-  const data = await file.arrayBuffer(); const wb = XLSX.read(data, { cellDates: true });
+  setProgress(`Reading ${file.name} into memory...`);
+  await new Promise(r => setTimeout(r, 50));
+  const data = await file.arrayBuffer();
+  setProgress(`Parsing ${file.name} workbook...`);
+  await new Promise(r => setTimeout(r, 50));
+  const wb = XLSX.read(data, { cellDates: true });
   for (const sn of wb.SheetNames) {
     if (sn.toLowerCase().includes("log") || sn.toLowerCase().includes("claude")) continue;
-    setProgress(`Parsing ${file.name} / ${sn}...`); const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { defval: "" }); totalRows += rows.length;
+    setProgress(`Extracting rows from ${file.name} / ${sn}...`);
+    await new Promise(r => setTimeout(r, 30));
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], { defval: "" }); totalRows += rows.length;
+    setProgress(`Processing ${rows.length.toLocaleString()} rows from ${sn}...`);
+    await new Promise(r => setTimeout(r, 30));
     for (const row of rows) {
       const txn = String(row["Txn. Type"] || "").trim(), whs = String(row["Whs."] || "").trim(), whsTo = String(row["Whs. To"] || "").trim();
       const pallet = String(row["Pallet"] || "").trim(), material = String(row["Material"] || "").trim(), qty = parseInt(row["Qty"]) || 0;
@@ -483,13 +492,19 @@ export default function App() {
     setProcessing(true);
     try {
       let acc = [...rawTx]; const nf = [...loadedFiles];
-      for (const file of arr) {
-        if (loadedFiles.some(f => f.name === file.name)) { setProgress(`${file.name} already loaded`); await new Promise(r => setTimeout(r, 400)); continue; }
-        setProgress(`Reading ${file.name}...`); const res = await parseFileToTransactions(file, setProgress);
-        acc = acc.concat(res.transactions); nf.push({ name: file.name, rows: res.totalRows, txCount: res.transactions.length });
+      for (let i = 0; i < arr.length; i++) {
+        const file = arr[i];
+        if (loadedFiles.some(f => f.name === file.name)) { setProgress(`${file.name} already loaded, skipping...`); await new Promise(r => setTimeout(r, 400)); continue; }
+        setProgress(`File ${i + 1} of ${arr.length}: ${file.name}...`);
+        await new Promise(r => setTimeout(r, 50));
+        const res = await parseFileToTransactions(file, setProgress);
+        acc = acc.concat(res.transactions);
+        nf.push({ name: file.name, rows: res.totalRows, txCount: res.transactions.length });
+        setProgress(`${file.name} complete: ${res.totalRows.toLocaleString()} rows, ${res.transactions.length.toLocaleString()} OCS transactions`);
+        await new Promise(r => setTimeout(r, 300));
       }
       setRawTx(acc); setLoadedFiles(nf);
-      if (auto && acc.length > 0) { setProgress("Rebuilding..."); await new Promise(r => setTimeout(r, 50)); setLifecycles(rebuildFromTransactions(acc, rates)); }
+      if (auto && acc.length > 0) { setProgress("Building lifecycles from all transactions..."); await new Promise(r => setTimeout(r, 100)); setLifecycles(rebuildFromTransactions(acc, rates)); }
       setProgress(""); setProcessing(false);
     } catch (err) { setProgress(`Error: ${err.message}`); setProcessing(false); }
   }, [rawTx, loadedFiles, rates]);
@@ -616,8 +631,14 @@ export default function App() {
 
             {loadedFiles.length > 0 && !processing && <button onClick={reset} style={{ padding: "12px 20px", borderRadius: 10, border: `1px solid ${CV.creamDark}`, cursor: "pointer", fontSize: 13, fontWeight: 600, color: "#999", background: "#fff" }}>Start Over</button>}
           </div>
-          {progress && <div style={{ marginTop: 16, padding: "12px 16px", background: CV.navyLight, borderRadius: 8, fontSize: 12, color: CV.navy, textAlign: "center" }}>{progress}</div>}
-          {loadedFiles.length > 0 && !processing && <div style={{ marginTop: 20, textAlign: "center" }}><button onClick={() => setLifecycles(rebuildFromTransactions(rawTx, rates))} style={{ padding: "12px 28px", borderRadius: 10, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 700, color: "#fff", background: CV.green }}>{loadedFiles.length >= 3 ? "Build Lifecycles" : "Analyze What's Loaded"}</button></div>}
+          {(progress || processing) && <div style={{ marginTop: 16, padding: "16px 20px", background: CV.navyLight, borderRadius: 10, fontSize: 13, color: CV.navy, textAlign: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}>
+              {processing && <div style={{ width: 20, height: 20, border: `3px solid ${CV.creamDark}`, borderTopColor: CV.navy, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />}
+              <span>{progress || "Processing..."}</span>
+            </div>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          </div>}
+          {loadedFiles.length > 0 && !processing && <div style={{ marginTop: 20, textAlign: "center" }}><button onClick={async () => { setProcessing(true); setProgress("Building lifecycles from all transactions..."); await new Promise(r => setTimeout(r, 100)); setLifecycles(rebuildFromTransactions(rawTx, rates)); setProcessing(false); setProgress(""); }} style={{ padding: "12px 28px", borderRadius: 10, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 700, color: "#fff", background: CV.green }}>{loadedFiles.length >= 3 ? "Build Lifecycles" : "Analyze What's Loaded"}</button></div>}
         </div>
       </div>
     );
