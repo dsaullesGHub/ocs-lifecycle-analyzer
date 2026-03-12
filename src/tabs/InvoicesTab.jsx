@@ -18,7 +18,14 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [selectedInv, setSelectedInv] = useState(null);
+  const [diagLog, setDiagLog] = useState([]);
+  const [showDiag, setShowDiag] = useState(false);
   const fileRef = useRef(null);
+
+  const addLog = useCallback((msg) => {
+    console.log("[InvoicesTab]", msg);
+    setDiagLog(prev => [...prev, `${new Date().toLocaleTimeString()}: ${msg}`]);
+  }, []);
 
   const detectVendor = (fileName) => {
     const n = fileName.toUpperCase();
@@ -47,6 +54,8 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
     const files = Array.from(fileList).filter(f => f.name.match(/\.(pdf|zip)$/i));
     if (!files.length) { setError("No PDF or ZIP files found."); return; }
     setProcessing(true); setError(""); setProgress("");
+    setDiagLog([]);
+    addLog(`Starting: ${files.length} file(s) selected`);
 
     const newInvoices = [...invoices];
     let processed = 0, errors = 0, totalInvFound = 0;
@@ -54,30 +63,40 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
       try {
+        addLog(`File ${fi + 1}/${files.length}: ${file.name} (${(file.size / 1024).toFixed(0)} KB)`);
         setProgress(`File ${fi + 1} of ${files.length}: ${file.name}...`);
-        await new Promise(r => setTimeout(r, 50)); // yield to UI
+        await new Promise(r => setTimeout(r, 50));
         const v = vendor !== "auto" ? vendor : null;
+        const detectedV = v || detectVendor(file.name);
+        addLog(`Vendor: ${detectedV || "UNKNOWN"} (${v ? "manual" : "auto-detected"})`);
+        if (!detectedV) throw new Error(`Cannot detect vendor for "${file.name}". Select vendor manually.`);
         const results = await processFile(file, v);
         const resultArray = Array.isArray(results) ? results : [results];
+        addLog(`Parsed: ${resultArray.length} invoice(s) from ${file.name}`);
         for (const inv of resultArray) {
+          addLog(`  Invoice #${inv.invoiceNumber || "?"}: ${inv.vendor} ${inv.location} total=${inv.total}`);
           const exists = newInvoices.some(e => e.invoiceNumber === inv.invoiceNumber && e.vendor === inv.vendor);
           if (!exists) { newInvoices.push({ ...inv, sourceFile: file.name }); totalInvFound++; }
+          else addLog(`  Skipped (duplicate): #${inv.invoiceNumber}`);
         }
         processed++;
         setProgress(`${file.name}: ${resultArray.length} invoice(s) found`);
-        await new Promise(r => setTimeout(r, 200)); // brief pause to show result
+        await new Promise(r => setTimeout(r, 200));
       } catch (err) {
         errors++;
+        addLog(`ERROR in ${file.name}: ${err.message}`);
         console.error(`Invoice processing error for ${file.name}:`, err);
         setError(prev => prev ? `${prev}\n${file.name}: ${err.message}` : `${file.name}: ${err.message}`);
         await new Promise(r => setTimeout(r, 100));
       }
     }
 
+    addLog(`Complete: ${processed} files, ${totalInvFound} invoices added, ${errors} errors`);
     setInvoices(newInvoices);
     setProgress(`Complete: ${processed} file${processed !== 1 ? "s" : ""}, ${totalInvFound} invoice${totalInvFound !== 1 ? "s" : ""} added${errors > 0 ? `, ${errors} error${errors !== 1 ? "s" : ""}` : ""}`);
     setProcessing(false);
-  }, [invoices, setInvoices, vendor, processFile]);
+    if (totalInvFound === 0 && errors === 0) setShowDiag(true); // Auto-show diagnostics if nothing found
+  }, [invoices, setInvoices, vendor, processFile, addLog]);
 
   const clearInvoices = () => { setInvoices([]); setSelectedInv(null); setError(""); setProgress(""); };
 
@@ -149,6 +168,20 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
           </div>
         )}
         {error && <div style={{ marginTop: 8, padding: "10px 14px", background: "#FEEEEC", borderRadius: 8, fontSize: 12, color: CV.red, whiteSpace: "pre-wrap" }}>{error}</div>}
+
+        {/* Diagnostic log */}
+        {diagLog.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <button onClick={() => setShowDiag(!showDiag)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: CV.teal, fontWeight: 600, padding: 0 }}>
+              {showDiag ? "Hide" : "Show"} diagnostic log ({diagLog.length} entries)
+            </button>
+            {showDiag && (
+              <pre style={{ marginTop: 6, padding: "10px 14px", background: "#f8f8f8", borderRadius: 8, fontSize: 10, color: "#444", maxHeight: 200, overflowY: "auto", fontFamily: "monospace", lineHeight: 1.6, border: `1px solid ${CV.creamDark}` }}>
+                {diagLog.join("\n")}
+              </pre>
+            )}
+          </div>
+        )}
       </Card>
 
       {/* Summary */}

@@ -130,15 +130,26 @@ function buildInvoiceResult(summary, detailLines, parseErrors) {
 }
 
 export async function parseNACSInvoice(file, onProgress) {
+  console.log("[NACS] Starting parse:", file.name, "size:", file.size);
   const arrayBuffer = await file.arrayBuffer();
+  console.log("[NACS] ArrayBuffer read, length:", arrayBuffer.byteLength);
+
   const fileType = await detectFileType(arrayBuffer);
+  console.log("[NACS] File type detected:", fileType);
+
   let pageTexts = [];
 
   if (fileType === "pdf") {
     if (onProgress) onProgress(`Extracting text from ${file.name}...`);
     await new Promise(r => setTimeout(r, 30));
-    const extracted = await extractPdfPages(arrayBuffer);
-    pageTexts = extracted.pages;
+    try {
+      const extracted = await extractPdfPages(arrayBuffer);
+      pageTexts = extracted.pages;
+      console.log("[NACS] PDF extracted:", extracted.numPages, "pages");
+    } catch (err) {
+      console.error("[NACS] PDF extraction failed:", err);
+      throw new Error(`PDF extraction failed for ${file.name}: ${err.message}`);
+    }
   } else if (fileType === "zip") {
     if (onProgress) onProgress(`Reading ZIP: ${file.name}...`);
     if (!window.JSZip) {
@@ -158,11 +169,17 @@ export async function parseNACSInvoice(file, onProgress) {
         pageTexts.push(text);
       }
     }
+    console.log("[NACS] ZIP extracted:", pageTexts.length, "pages");
   } else {
-    throw new Error("Unrecognized file format. Expected NACS PDF or ZIP.");
+    throw new Error(`Unrecognized file format for ${file.name}. Expected NACS PDF or ZIP.`);
   }
 
-  if (pageTexts.length === 0) throw new Error("No pages found in file.");
+  if (pageTexts.length === 0) throw new Error(`No pages found in ${file.name}.`);
+
+  // Log first 200 chars of each page for debugging
+  pageTexts.forEach((pt, i) => {
+    console.log(`[NACS] Page ${i + 1} (${pt.length} chars): "${pt.substring(0, 200).replace(/\n/g, " | ")}..."`);
+  });
 
   if (onProgress) onProgress(`Parsing ${pageTexts.length} pages from ${file.name}...`);
   await new Promise(r => setTimeout(r, 30));
@@ -172,24 +189,24 @@ export async function parseNACSInvoice(file, onProgress) {
   let currentGroup = null;
 
   for (let i = 0; i < pageTexts.length; i++) {
-    if (isSummaryPage(pageTexts[i])) {
-      // Start a new invoice group
+    const isSummary = isSummaryPage(pageTexts[i]);
+    console.log(`[NACS] Page ${i + 1}: isSummary=${isSummary}`);
+    if (isSummary) {
       if (currentGroup) invoiceGroups.push(currentGroup);
       currentGroup = { summaryPageIdx: i, detailPageIdxs: [] };
     } else if (currentGroup) {
       currentGroup.detailPageIdxs.push(i);
     } else {
-      // Detail page before any summary -- treat page 0 as summary regardless
       currentGroup = { summaryPageIdx: i, detailPageIdxs: [] };
     }
   }
   if (currentGroup) invoiceGroups.push(currentGroup);
 
-  // If grouping found nothing, fall back to old behavior: page 0 = summary, rest = detail
   if (invoiceGroups.length === 0) {
     invoiceGroups.push({ summaryPageIdx: 0, detailPageIdxs: Array.from({ length: pageTexts.length - 1 }, (_, i) => i + 1) });
   }
 
+  console.log("[NACS] Invoice groups:", invoiceGroups.length, invoiceGroups.map(g => `summary:${g.summaryPageIdx} detail:[${g.detailPageIdxs.join(",")}]`));
   if (onProgress) onProgress(`Found ${invoiceGroups.length} invoice(s) in ${file.name}...`);
   await new Promise(r => setTimeout(r, 30));
 
@@ -197,6 +214,7 @@ export async function parseNACSInvoice(file, onProgress) {
   const results = [];
   for (const group of invoiceGroups) {
     const summary = parseSummaryPage(pageTexts[group.summaryPageIdx]);
+    console.log("[NACS] Summary parsed:", JSON.stringify(summary));
     const detailLines = [];
     const parseErrors = [];
 
@@ -210,7 +228,6 @@ export async function parseNACSInvoice(file, onProgress) {
       }
     }
 
-    // Also parse detail lines from the summary page itself (some invoices mix them)
     const summaryLines = pageTexts[group.summaryPageIdx].replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
     for (const line of summaryLines) {
       if (!/^\d{2}\/\d{2}\/\d{4}/.test(line)) continue;
@@ -219,9 +236,13 @@ export async function parseNACSInvoice(file, onProgress) {
       if (parsed) detailLines.push(parsed);
     }
 
+    console.log("[NACS] Group result: invNum=", summary.invoiceNumber, "detailLines=", detailLines.length, "parseErrors=", parseErrors.length);
     const result = buildInvoiceResult(summary, detailLines, parseErrors);
+    console.log("[NACS] Built result: total=", result.total, "pallets=", result.palletsBilled);
     if (result.invoiceNumber || result.total > 0) results.push(result);
+    else console.warn("[NACS] Skipping group: no invoice number and total=0");
   }
 
+  console.log("[NACS] Final results:", results.length, "invoices");
   return results;
 }

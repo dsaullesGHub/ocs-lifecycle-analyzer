@@ -1,6 +1,11 @@
 // PDF text extraction and file type detection utilities
 import * as pdfjsLib from 'pdfjs-dist';
-pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+// Disable worker - run on main thread for reliability in browser environments
+pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+
+// Use fake worker (main thread) to avoid CORS/loading issues with CDN workers
+const PDFJS_CONFIG = { disableWorker: true };
 
 export async function detectFileType(arrayBuffer) {
   const bytes = new Uint8Array(arrayBuffer.slice(0, 4));
@@ -11,14 +16,31 @@ export async function detectFileType(arrayBuffer) {
 }
 
 export async function extractPdfPages(arrayBuffer) {
-  // Copy the buffer so the original isn't detached
-  const copy = arrayBuffer.slice(0);
-  const pdf = await pdfjsLib.getDocument({ data: copy }).promise;
+  const copy = new Uint8Array(arrayBuffer.slice(0));
+  console.log("[pdfUtils] extractPdfPages: buffer size", copy.length);
+
+  let pdf;
+  try {
+    pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
+  } catch (err) {
+    console.error("[pdfUtils] Failed to open PDF:", err);
+    throw new Error(`PDF open failed: ${err.message}`);
+  }
+
+  console.log("[pdfUtils] PDF opened, pages:", pdf.numPages);
   const pages = [];
+
   try {
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
+
+      if (!content.items || content.items.length === 0) {
+        console.warn(`[pdfUtils] Page ${i}: no text items found (may be scanned image)`);
+        pages.push("");
+        continue;
+      }
+
       const items = content.items.map(item => ({
         text: item.str,
         x: item.transform[4],
@@ -32,19 +54,24 @@ export async function extractPdfPages(arrayBuffer) {
       }
       const sortedYs = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
       const lineStrings = sortedYs.map(y =>
-        lineMap[y].sort((a, b) => a.x - b.x).map(i => i.text).join(" ").trim()
+        lineMap[y].sort((a, b) => a.x - b.x).map(it => it.text).join(" ").trim()
       ).filter(Boolean);
-      pages.push(lineStrings.join("\n"));
+
+      const pageText = lineStrings.join("\n");
+      console.log(`[pdfUtils] Page ${i}: ${content.items.length} items, ${lineStrings.length} lines, ${pageText.length} chars`);
+      pages.push(pageText);
     }
   } finally {
-    pdf.destroy();
+    try { pdf.destroy(); } catch (e) { /* ignore */ }
   }
+
+  console.log("[pdfUtils] Extraction complete:", pages.length, "pages,", pages.filter(p => p.length > 0).length, "with content");
   return { numPages: pages.length, pages };
 }
 
 export async function renderPdfPageAsBase64(arrayBuffer, pageNum, scale = 2.0) {
-  const copy = arrayBuffer.slice(0);
-  const pdf = await pdfjsLib.getDocument({ data: copy }).promise;
+  const copy = new Uint8Array(arrayBuffer.slice(0));
+  const pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
   try {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale });
@@ -55,14 +82,14 @@ export async function renderPdfPageAsBase64(arrayBuffer, pageNum, scale = 2.0) {
     await page.render({ canvasContext: ctx, viewport }).promise;
     return canvas.toDataURL("image/png").split(",")[1];
   } finally {
-    pdf.destroy();
+    try { pdf.destroy(); } catch (e) { /* ignore */ }
   }
 }
 
 export async function getPdfPageCount(arrayBuffer) {
-  const copy = arrayBuffer.slice(0);
-  const pdf = await pdfjsLib.getDocument({ data: copy }).promise;
+  const copy = new Uint8Array(arrayBuffer.slice(0));
+  const pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
   const count = pdf.numPages;
-  pdf.destroy();
+  try { pdf.destroy(); } catch (e) { /* ignore */ }
   return count;
 }
