@@ -544,6 +544,7 @@ export default function App() {
   const mtData = useMemo(() => computeMaterials(filtered), [filtered]);
   const actCodes = useMemo(() => actLocs.map(([c]) => c), [actLocs]);
   const searchRes = useMemo(() => { if (!costed || search.length < 3) return []; const q = search.toUpperCase(); return costed.filter(l => l.pallet.toUpperCase().includes(q) || l.material.toUpperCase().includes(q) || l.mfgLot.toUpperCase().includes(q)).slice(0, 500); }, [costed, search]);
+  const oppsData = useMemo(() => costed ? computeOpportunities(costed, rates) : [], [costed, rates]);
 
   // Landing
   if (!lifecycles) {
@@ -641,7 +642,6 @@ export default function App() {
   }
 
   const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
-  const oppsData = useMemo(() => costed ? computeOpportunities(costed, rates) : [], [costed, rates]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream, color: CV.navy }}>
