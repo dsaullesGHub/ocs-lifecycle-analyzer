@@ -16,29 +16,87 @@ const CONTRACTED_RATES = {
 
 function parseSummaryPage(text) {
   const lines = text.replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
+  const fullText = lines.join(" ");
   const result = { invoiceNumber: null, invoiceDate: null, selectedThrough: null, summaryCharges: [], invoiceTotal: null };
 
-  for (let i = 0; i < lines.length; i++) {
-    if (!result.invoiceNumber && /^\d{4,6}$/.test(lines[i])) result.invoiceNumber = lines[i];
-    if (!result.invoiceDate && /^\d{2}\/\d{2}\/\d{4}$/.test(lines[i])) result.invoiceDate = lines[i];
-    const stMatch = lines[i].match(/Selected Through:\s*(\d{2}\/\d{2}\/\d{4})/);
-    if (stMatch) result.selectedThrough = stMatch[1];
+  // Invoice number: 4-6 digit number, try multiple patterns
+  // Pattern 1: "Invoice Number" or "Invoice #" or "Invoice No" followed by number
+  const invNumMatch = fullText.match(/Invoice\s*(?:Number|#|No\.?)[:\s]*(\d{4,6})/i);
+  if (invNumMatch) result.invoiceNumber = invNumMatch[1];
+  // Pattern 2: Standalone 4-6 digit number on its own line
+  if (!result.invoiceNumber) {
+    for (const line of lines) {
+      if (/^\d{4,6}$/.test(line.trim())) { result.invoiceNumber = line.trim(); break; }
+    }
+  }
+  // Pattern 3: 4-6 digit number near the top of the page (first 10 lines)
+  if (!result.invoiceNumber) {
+    for (let i = 0; i < Math.min(10, lines.length); i++) {
+      const m = lines[i].match(/\b(\d{4,6})\b/);
+      if (m && !lines[i].match(/page|total|qty|quantity|rate/i)) { result.invoiceNumber = m[1]; break; }
+    }
+  }
 
-    const chargeMatch = lines[i].match(/^(.+?)\s+([\d,]+)\s+\$\s*([\d,.]+)\s+\$\s*([\d,.]+)\s+\$\s*([\d,.]+)$/);
+  // Invoice date: MM/DD/YYYY anywhere in text
+  // Pattern 1: Near "Invoice Date" label
+  const invDateMatch = fullText.match(/Invoice\s*Date[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+  if (invDateMatch) result.invoiceDate = invDateMatch[1];
+  // Pattern 2: First date found in the first 15 lines
+  if (!result.invoiceDate) {
+    for (let i = 0; i < Math.min(15, lines.length); i++) {
+      const dm = lines[i].match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+      if (dm) { result.invoiceDate = dm[1]; break; }
+    }
+  }
+
+  // Selected Through
+  const stMatch = fullText.match(/Selected\s*Through[:\s]*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+  if (stMatch) result.selectedThrough = stMatch[1];
+
+  // Charge lines: look for patterns with $ amounts
+  for (const line of lines) {
+    // Try multiple charge line formats
+    // Format 1: Description QTY $ rate $ rate $ extension
+    const chargeMatch = line.match(/^(.+?)\s+([\d,]+)\s+\$\s*([\d,.]+)\s+\$\s*([\d,.]+)\s+\$\s*([\d,.]+)$/);
     if (chargeMatch) {
       const fullDesc = chargeMatch[1].trim();
       let codeKey = null;
       for (const key of Object.keys(CONTRACTED_RATES)) { if (fullDesc.includes(key)) { codeKey = key; break; } }
-      result.summaryCharges.push({
-        rawDescription: fullDesc, codeKey,
-        quantity: parseFloat(chargeMatch[2].replace(/,/g, "")),
-        unitRate: parseFloat(chargeMatch[4].replace(/,/g, "")),
-        extension: parseFloat(chargeMatch[5].replace(/,/g, "")),
-      });
+      result.summaryCharges.push({ rawDescription: fullDesc, codeKey, quantity: parseFloat(chargeMatch[2].replace(/,/g, "")), unitRate: parseFloat(chargeMatch[4].replace(/,/g, "")), extension: parseFloat(chargeMatch[5].replace(/,/g, "")) });
+      continue;
     }
-    const totalMatch = lines[i].match(/^\$\s*([\d,]+\.\d{2})$/);
-    if (totalMatch && !result.invoiceTotal) result.invoiceTotal = parseFloat(totalMatch[1].replace(/,/g, ""));
+    // Format 2: Description QTY rate extension (no $ signs, just numbers)
+    const altMatch = line.match(/^(.+?)\s+([\d,]+)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)$/);
+    if (altMatch) {
+      const fullDesc = altMatch[1].trim();
+      const ext = parseFloat(altMatch[5].replace(/,/g, ""));
+      if (ext > 10 && fullDesc.length > 3) {
+        let codeKey = null;
+        for (const key of Object.keys(CONTRACTED_RATES)) { if (fullDesc.includes(key)) { codeKey = key; break; } }
+        result.summaryCharges.push({ rawDescription: fullDesc, codeKey, quantity: parseFloat(altMatch[2].replace(/,/g, "")), unitRate: parseFloat(altMatch[4].replace(/,/g, "")), extension: ext });
+      }
+    }
   }
+
+  // Invoice total: largest $ amount, or "Total" line, or standalone $ amount
+  const totalPatterns = [
+    /Total[:\s]*\$?\s*([\d,]+\.\d{2})/i,
+    /Amount\s*Due[:\s]*\$?\s*([\d,]+\.\d{2})/i,
+    /Balance\s*Due[:\s]*\$?\s*([\d,]+\.\d{2})/i,
+  ];
+  for (const pat of totalPatterns) {
+    const m = fullText.match(pat);
+    if (m) { result.invoiceTotal = parseFloat(m[1].replace(/,/g, "")); break; }
+  }
+  // Fallback: standalone $ amount line
+  if (!result.invoiceTotal) {
+    for (const line of lines) {
+      const tm = line.match(/^\$\s*([\d,]+\.\d{2})$/);
+      if (tm) { result.invoiceTotal = parseFloat(tm[1].replace(/,/g, "")); }
+    }
+  }
+
+  console.log("[NACS] parseSummaryPage result:", JSON.stringify(result, null, 2));
   return result;
 }
 

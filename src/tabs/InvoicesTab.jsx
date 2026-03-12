@@ -74,8 +74,10 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
         const resultArray = Array.isArray(results) ? results : [results];
         addLog(`Parsed: ${resultArray.length} invoice(s) from ${file.name}`);
         for (const inv of resultArray) {
-          addLog(`  Invoice #${inv.invoiceNumber || "?"}: ${inv.vendor} ${inv.location} total=${inv.total}`);
-          const exists = newInvoices.some(e => e.invoiceNumber === inv.invoiceNumber && e.vendor === inv.vendor);
+          addLog(`  Invoice #${inv.invoiceNumber || "?"}: ${inv.vendor} ${inv.location} date=${inv.invoiceDate || "?"} period=${inv.billingPeriod || "?"} total=${inv.total} pallets=${inv.palletsBilled} statedTotal=${inv.invoicedTotal || "?"}`);
+          const exists = inv.invoiceNumber
+            ? newInvoices.some(e => e.invoiceNumber === inv.invoiceNumber && e.vendor === inv.vendor)
+            : false; // Never dedup invoices without a number
           if (!exists) { newInvoices.push({ ...inv, sourceFile: file.name }); totalInvFound++; }
           else addLog(`  Skipped (duplicate): #${inv.invoiceNumber}`);
         }
