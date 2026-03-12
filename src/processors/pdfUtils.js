@@ -1,11 +1,8 @@
 // PDF text extraction and file type detection utilities
 import * as pdfjsLib from 'pdfjs-dist';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.js?url';
 
-// Disable worker - run on main thread for reliability in browser environments
-pdfjsLib.GlobalWorkerOptions.workerSrc = '';
-
-// Use fake worker (main thread) to avoid CORS/loading issues with CDN workers
-const PDFJS_CONFIG = { disableWorker: true };
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 export async function detectFileType(arrayBuffer) {
   const bytes = new Uint8Array(arrayBuffer.slice(0, 4));
@@ -21,7 +18,7 @@ export async function extractPdfPages(arrayBuffer) {
 
   let pdf;
   try {
-    pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
+    pdf = await pdfjsLib.getDocument({ data: copy }).promise;
   } catch (err) {
     console.error("[pdfUtils] Failed to open PDF:", err);
     throw new Error(`PDF open failed: ${err.message}`);
@@ -71,7 +68,7 @@ export async function extractPdfPages(arrayBuffer) {
 
 export async function renderPdfPageAsBase64(arrayBuffer, pageNum, scale = 2.0) {
   const copy = new Uint8Array(arrayBuffer.slice(0));
-  const pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
+  const pdf = await pdfjsLib.getDocument({ data: copy }).promise;
   try {
     const page = await pdf.getPage(pageNum);
     const viewport = page.getViewport({ scale });
@@ -88,7 +85,7 @@ export async function renderPdfPageAsBase64(arrayBuffer, pageNum, scale = 2.0) {
 
 export async function getPdfPageCount(arrayBuffer) {
   const copy = new Uint8Array(arrayBuffer.slice(0));
-  const pdf = await pdfjsLib.getDocument({ data: copy, ...PDFJS_CONFIG }).promise;
+  const pdf = await pdfjsLib.getDocument({ data: copy }).promise;
   const count = pdf.numPages;
   try { pdf.destroy(); } catch (e) { /* ignore */ }
   return count;
