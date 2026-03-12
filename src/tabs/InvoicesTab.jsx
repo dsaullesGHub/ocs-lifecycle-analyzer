@@ -33,15 +33,12 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
     if (!v) throw new Error(`Cannot detect vendor for "${file.name}". Please select vendor manually.`);
 
     if (v === "NACS") {
-      const result = await parseNACSInvoice(file, setProgress);
-      return [result];
+      return await parseNACSInvoice(file, setProgress);
     } else if (v === "Interstate") {
-      const results = await parseInterstateInvoice(file, setProgress);
-      return results;
+      return await parseInterstateInvoice(file, setProgress);
     } else if (v === "Mesa") {
       if (!apiKey) throw new Error("Enter your Anthropic API key to process Mesa invoices.");
-      const results = await parseMesaInvoice(file, apiKey, setProgress);
-      return results;
+      return await parseMesaInvoice(file, apiKey, setProgress);
     }
     throw new Error(`Unknown vendor: ${v}`);
   }, [apiKey]);
@@ -52,27 +49,33 @@ export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyCha
     setProcessing(true); setError(""); setProgress("");
 
     const newInvoices = [...invoices];
-    let processed = 0, errors = 0;
+    let processed = 0, errors = 0, totalInvFound = 0;
 
-    for (const file of files) {
+    for (let fi = 0; fi < files.length; fi++) {
+      const file = files[fi];
       try {
-        setProgress(`Processing ${file.name} (${processed + 1}/${files.length})...`);
+        setProgress(`File ${fi + 1} of ${files.length}: ${file.name}...`);
+        await new Promise(r => setTimeout(r, 50)); // yield to UI
         const v = vendor !== "auto" ? vendor : null;
         const results = await processFile(file, v);
-        for (const inv of results) {
-          // Deduplicate by invoice number + vendor
+        const resultArray = Array.isArray(results) ? results : [results];
+        for (const inv of resultArray) {
           const exists = newInvoices.some(e => e.invoiceNumber === inv.invoiceNumber && e.vendor === inv.vendor);
-          if (!exists) newInvoices.push({ ...inv, sourceFile: file.name });
+          if (!exists) { newInvoices.push({ ...inv, sourceFile: file.name }); totalInvFound++; }
         }
         processed++;
+        setProgress(`${file.name}: ${resultArray.length} invoice(s) found`);
+        await new Promise(r => setTimeout(r, 200)); // brief pause to show result
       } catch (err) {
         errors++;
+        console.error(`Invoice processing error for ${file.name}:`, err);
         setError(prev => prev ? `${prev}\n${file.name}: ${err.message}` : `${file.name}: ${err.message}`);
+        await new Promise(r => setTimeout(r, 100));
       }
     }
 
     setInvoices(newInvoices);
-    setProgress(errors > 0 ? `Done: ${processed} processed, ${errors} errors` : `Done: ${processed} file${processed !== 1 ? "s" : ""} processed`);
+    setProgress(`Complete: ${processed} file${processed !== 1 ? "s" : ""}, ${totalInvFound} invoice${totalInvFound !== 1 ? "s" : ""} added${errors > 0 ? `, ${errors} error${errors !== 1 ? "s" : ""}` : ""}`);
     setProcessing(false);
   }, [invoices, setInvoices, vendor, processFile]);
 

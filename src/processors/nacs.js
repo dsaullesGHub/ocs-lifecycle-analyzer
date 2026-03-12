@@ -70,57 +70,16 @@ function parseDetailLine(line) {
   return { chargeDate, itemCode, description, expirationDate: expDate, pid: pidMatch[1], qty: 1, uom: "PL", chargeCodeRaw, codeKey, rate, extension };
 }
 
-export async function parseNACSInvoice(file, onProgress) {
-  const arrayBuffer = await file.arrayBuffer();
-  const fileType = await detectFileType(arrayBuffer);
-  let pageTexts = [];
+function isSummaryPage(text) {
+  // Summary pages have charge summary lines with $ and typically contain "Invoice Number" or "Selected Through"
+  const hasCharges = /\$\s*[\d,]+\.\d{2}/.test(text);
+  const hasInvMarker = /Selected Through|Invoice\s*(Number|Date)/i.test(text);
+  const hasDetailLines = (text.match(/^\d{2}\/\d{2}\/\d{4}\s+\d{5}/gm) || []).length;
+  // Summary pages have few detail lines (maybe 0), detail pages have many
+  return (hasCharges && hasInvMarker) || (hasCharges && hasDetailLines < 3);
+}
 
-  if (fileType === "pdf") {
-    if (onProgress) onProgress("Extracting text from PDF...");
-    const extracted = await extractPdfPages(arrayBuffer);
-    pageTexts = extracted.pages;
-  } else if (fileType === "zip") {
-    if (onProgress) onProgress("Reading ZIP archive...");
-    // Dynamic import JSZip from CDN
-    if (!window.JSZip) {
-      await new Promise((resolve, reject) => {
-        const s = document.createElement("script");
-        s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
-        s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
-      });
-    }
-    const zip = await window.JSZip.loadAsync(arrayBuffer);
-    const manifestRaw = await zip.file("manifest.json")?.async("string");
-    if (manifestRaw) {
-      const manifest = JSON.parse(manifestRaw);
-      for (const pg of manifest.pages) {
-        const txtFile = zip.file(pg.text?.path);
-        const text = txtFile ? await txtFile.async("string") : "";
-        pageTexts.push(text);
-      }
-    }
-  } else {
-    throw new Error("Unrecognized file format. Expected NACS PDF or ZIP.");
-  }
-
-  if (pageTexts.length === 0) throw new Error("No pages found in file.");
-
-  if (onProgress) onProgress("Parsing invoice structure...");
-  const summary = parseSummaryPage(pageTexts[0]);
-  const detailLines = [];
-  const parseErrors = [];
-
-  for (let i = 1; i < pageTexts.length; i++) {
-    const lines = pageTexts[i].replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
-    for (const line of lines) {
-      if (!/^\d{2}\/\d{2}\/\d{4}/.test(line)) continue;
-      if (line.split(/\s+/).length < 6) continue;
-      const parsed = parseDetailLine(line);
-      if (parsed) detailLines.push(parsed); else parseErrors.push(line);
-    }
-  }
-
-  // Aggregate charges
+function buildInvoiceResult(summary, detailLines, parseErrors) {
   const chargeMap = {};
   for (const dl of detailLines) {
     const key = dl.codeKey || dl.chargeCodeRaw;
@@ -143,7 +102,6 @@ export async function parseNACSInvoice(file, onProgress) {
   const assessorialsTotal = lineItems.filter(l => l.category === "assessorial").reduce((s, l) => s + l.extension, 0);
   const computedTotal = parseFloat((storageCharge + handlingCharge + assessorialsTotal).toFixed(2));
 
-  // Determine billing period from invoice date
   let billingPeriod = null;
   if (summary.invoiceDate) {
     const parts = summary.invoiceDate.split("/");
@@ -169,4 +127,101 @@ export async function parseNACSInvoice(file, onProgress) {
     parseErrors: parseErrors.length,
     raw: { summary, detailLineCount: detailLines.length, parseErrorCount: parseErrors.length },
   };
+}
+
+export async function parseNACSInvoice(file, onProgress) {
+  const arrayBuffer = await file.arrayBuffer();
+  const fileType = await detectFileType(arrayBuffer);
+  let pageTexts = [];
+
+  if (fileType === "pdf") {
+    if (onProgress) onProgress(`Extracting text from ${file.name}...`);
+    await new Promise(r => setTimeout(r, 30));
+    const extracted = await extractPdfPages(arrayBuffer);
+    pageTexts = extracted.pages;
+  } else if (fileType === "zip") {
+    if (onProgress) onProgress(`Reading ZIP: ${file.name}...`);
+    if (!window.JSZip) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+        s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+      });
+    }
+    const zip = await window.JSZip.loadAsync(arrayBuffer);
+    const manifestRaw = await zip.file("manifest.json")?.async("string");
+    if (manifestRaw) {
+      const manifest = JSON.parse(manifestRaw);
+      for (const pg of manifest.pages) {
+        const txtFile = zip.file(pg.text?.path);
+        const text = txtFile ? await txtFile.async("string") : "";
+        pageTexts.push(text);
+      }
+    }
+  } else {
+    throw new Error("Unrecognized file format. Expected NACS PDF or ZIP.");
+  }
+
+  if (pageTexts.length === 0) throw new Error("No pages found in file.");
+
+  if (onProgress) onProgress(`Parsing ${pageTexts.length} pages from ${file.name}...`);
+  await new Promise(r => setTimeout(r, 30));
+
+  // Group pages into invoices: each summary page starts a new invoice
+  const invoiceGroups = [];
+  let currentGroup = null;
+
+  for (let i = 0; i < pageTexts.length; i++) {
+    if (isSummaryPage(pageTexts[i])) {
+      // Start a new invoice group
+      if (currentGroup) invoiceGroups.push(currentGroup);
+      currentGroup = { summaryPageIdx: i, detailPageIdxs: [] };
+    } else if (currentGroup) {
+      currentGroup.detailPageIdxs.push(i);
+    } else {
+      // Detail page before any summary -- treat page 0 as summary regardless
+      currentGroup = { summaryPageIdx: i, detailPageIdxs: [] };
+    }
+  }
+  if (currentGroup) invoiceGroups.push(currentGroup);
+
+  // If grouping found nothing, fall back to old behavior: page 0 = summary, rest = detail
+  if (invoiceGroups.length === 0) {
+    invoiceGroups.push({ summaryPageIdx: 0, detailPageIdxs: Array.from({ length: pageTexts.length - 1 }, (_, i) => i + 1) });
+  }
+
+  if (onProgress) onProgress(`Found ${invoiceGroups.length} invoice(s) in ${file.name}...`);
+  await new Promise(r => setTimeout(r, 30));
+
+  // Parse each group
+  const results = [];
+  for (const group of invoiceGroups) {
+    const summary = parseSummaryPage(pageTexts[group.summaryPageIdx]);
+    const detailLines = [];
+    const parseErrors = [];
+
+    for (const di of group.detailPageIdxs) {
+      const lines = pageTexts[di].replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        if (!/^\d{2}\/\d{2}\/\d{4}/.test(line)) continue;
+        if (line.split(/\s+/).length < 6) continue;
+        const parsed = parseDetailLine(line);
+        if (parsed) detailLines.push(parsed); else parseErrors.push(line);
+      }
+    }
+
+    // Also parse detail lines from the summary page itself (some invoices mix them)
+    const summaryLines = pageTexts[group.summaryPageIdx].replace(/\r\n/g, "\n").split("\n").map(l => l.trim()).filter(Boolean);
+    for (const line of summaryLines) {
+      if (!/^\d{2}\/\d{2}\/\d{4}/.test(line)) continue;
+      if (line.split(/\s+/).length < 6) continue;
+      const parsed = parseDetailLine(line);
+      if (parsed) detailLines.push(parsed);
+    }
+
+    const result = buildInvoiceResult(summary, detailLines, parseErrors);
+    if (result.invoiceNumber || result.total > 0) results.push(result);
+  }
+
+  return results;
 }
