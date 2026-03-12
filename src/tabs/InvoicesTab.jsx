@@ -11,14 +11,13 @@ const fmtN = (v) => v == null ? "---" : v.toLocaleString();
 function Badge({ bg, color, children }) { return <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 99, background: bg, color, whiteSpace: "nowrap" }}>{children}</span>; }
 function Card({ children, style }) { return <div style={{ background: "#fff", borderRadius: 12, padding: "20px 24px", border: `1px solid ${CV.creamDark}`, ...style }}>{children}</div>; }
 
-export default function InvoicesTab({ invoices, setInvoices }) {
+export default function InvoicesTab({ invoices, setInvoices, apiKey, onApiKeyChange }) {
   const [vendor, setVendor] = useState("auto");
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [selectedInv, setSelectedInv] = useState(null);
-  const [apiKey, setApiKey] = useState("");
   const fileRef = useRef(null);
 
   const detectVendor = (fileName) => {
@@ -111,7 +110,7 @@ export default function InvoicesTab({ invoices, setInvoices }) {
           {(vendor === "Mesa" || vendor === "auto") && (
             <div style={{ flex: "1 0 250px" }}>
               <div style={{ fontSize: 10, fontWeight: 700, color: CV.navy, marginBottom: 4 }}>ANTHROPIC API KEY (Mesa only)</div>
-              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
+              <input type="password" value={apiKey} onChange={e => onApiKeyChange(e.target.value)}
                 placeholder="sk-ant-..."
                 style={{ width: "100%", padding: "6px 10px", borderRadius: 6, border: `1px solid ${CV.creamDark}`, fontSize: 12, fontFamily: "monospace" }} />
             </div>

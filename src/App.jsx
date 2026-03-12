@@ -3,6 +3,7 @@ import * as XLSX from "xlsx";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from "recharts";
 import InvoicesTab from "./tabs/InvoicesTab.jsx";
 import ReconciliationTab from "./tabs/ReconciliationTab.jsx";
+import AIAgentTab from "./tabs/AIAgentTab.jsx";
 
 // ── IndexedDB Persistence ────────────────────────────────────────────────────
 const DB_NAME = "ocs-lifecycle-db";
@@ -476,6 +477,7 @@ export default function App() {
   const [tab, setTab] = useState("overview");
   const [search, setSearch] = useState("");
   const [invoiceData, setInvoiceData] = useState([]);
+  const [apiKey, setApiKey] = useState("");
   const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", vendors: [], locations: [], materialSearch: "", statusFilter: "" });
   const [drillMat, setDrillMat] = useState(null);
   const [drillLoc, setDrillLoc] = useState(null);
@@ -686,7 +688,7 @@ export default function App() {
     );
   }
 
-  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "invoices", l: "Invoices" }, { k: "reconciliation", l: "Reconciliation" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
+  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "invoices", l: "Invoices" }, { k: "reconciliation", l: "Reconciliation" }, { k: "agent", l: "AI Agent" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream, color: CV.navy }}>
@@ -709,7 +711,7 @@ export default function App() {
         {TABS.map(t => <button key={t.k} onClick={() => { setTab(t.k); setDrillMat(null); setDrillLoc(null); }} style={{ padding: "10px 16px", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600, background: "transparent", color: tab === t.k ? CV.navy : "#999", borderBottom: tab === t.k ? `3px solid ${CV.red}` : "3px solid transparent" }}>{t.l}</button>)}
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-        {!["rates", "search", "invoices", "reconciliation"].includes(tab) && costed && <FilterBar filters={filters} setFilters={setFilters} lifecycles={costed} />}
+        {!["rates", "search", "invoices", "reconciliation", "agent"].includes(tab) && costed && <FilterBar filters={filters} setFilters={setFilters} lifecycles={costed} />}
 
         {tab === "overview" && <>
           <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
@@ -1010,9 +1012,11 @@ export default function App() {
           {search.length >= 3 && !searchRes.length && <div style={{ padding: 32, textAlign: "center", color: "#aaa" }}>No results</div>}
         </>}
 
-        {tab === "invoices" && <InvoicesTab invoices={invoiceData} setInvoices={setInvoiceData} />}
+        {tab === "invoices" && <InvoicesTab invoices={invoiceData} setInvoices={setInvoiceData} apiKey={apiKey} onApiKeyChange={setApiKey} />}
 
         {tab === "reconciliation" && <ReconciliationTab invoices={invoiceData} lifecycles={costed} />}
+
+        {tab === "agent" && <AIAgentTab lifecycles={costed} invoices={invoiceData} rates={rates} locStats={locStats} oppsData={oppsData} apiKey={apiKey} onApiKeyChange={setApiKey} />}
 
         {tab === "rates" && <>
           <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 800 }}>Rate Cards</h2>
