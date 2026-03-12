@@ -296,18 +296,32 @@ function FilterBar({ filters, setFilters, lifecycles }) {
 function computeOpportunities(lifecycles, rates) {
   const opps = [];
 
+  // Helper: group lifecycles by month using a date field
+  const byMonth = (items, dateFn) => {
+    const m = {};
+    for (const lc of items) {
+      const d = dateFn(lc); if (!d) continue;
+      const k = mKey(d);
+      if (!m[k]) m[k] = { period: k, count: 0, cost: 0 };
+      m[k].count++;
+      m[k].cost += lc.totalCost || 0;
+    }
+    return Object.values(m).sort((a, b) => a.period.localeCompare(b.period));
+  };
+
   // 1. Short-dwell pallets (<=7 days) - why was this in OCS?
   const shortDwell = lifecycles.filter(lc => !lc.preExisting && !lc.open && lc.dwell != null && lc.dwell <= 7);
   if (shortDwell.length > 0) {
     const costWasted = shortDwell.reduce((s, lc) => s + (lc.totalCost || 0), 0);
     const byLoc = {};
     for (const lc of shortDwell) { byLoc[lc.loc] = (byLoc[lc.loc] || 0) + 1; }
+    const trend = byMonth(shortDwell, lc => lc.exitDate);
     opps.push({
       id: "short-dwell", severity: "high", category: "Avoidable Cost",
       title: `${shortDwell.length.toLocaleString()} pallets left OCS within 7 days`,
       subtitle: "Product that enters and exits within a week may not need outside storage. Each pallet incurs full handling + initial storage charges regardless of dwell time.",
       metric: costWasted, metricLabel: "handling + storage charged",
-      detail: shortDwell, byLoc,
+      detail: shortDwell, byLoc, trend,
       recommendation: "Evaluate whether these materials could ship direct from F7 or use a cross-dock arrangement to avoid the initial storage charge.",
     });
   }
@@ -316,12 +330,17 @@ function computeOpportunities(lifecycles, rates) {
   const nearMiss = lifecycles.filter(lc => !lc.preExisting && !lc.open && lc.dwell != null && lc.renewalCycles > 0 && (lc.dwell % (rates[lc.loc]?.cycleDays || 30)) <= 3);
   if (nearMiss.length > 0) {
     const extraCost = nearMiss.reduce((s, lc) => s + (rates[lc.loc]?.renewalStorage || 0), 0);
+    const trend = byMonth(nearMiss, lc => lc.exitDate).map(t => {
+      // Recalculate avoidable cost per month
+      const monthItems = nearMiss.filter(lc => lc.exitDate && mKey(lc.exitDate) === t.period);
+      return { ...t, cost: monthItems.reduce((s, lc) => s + (rates[lc.loc]?.renewalStorage || 0), 0) };
+    });
     opps.push({
       id: "cycle-threshold", severity: "medium", category: "Timing Optimization",
       title: `${nearMiss.length.toLocaleString()} pallets crossed a renewal cycle by 1-3 days`,
       subtitle: "These pallets triggered an additional 30-day storage cycle because they stayed just slightly past the threshold. Earlier pull could have avoided the renewal charge.",
       metric: extraCost, metricLabel: "in avoidable renewal charges",
-      detail: nearMiss, byLoc: {},
+      detail: nearMiss, byLoc: {}, trend,
       recommendation: "Prioritize pull-forward on pallets approaching cycle boundaries. A 2-3 day earlier shipment would save the full renewal fee per pallet.",
     });
   }
@@ -332,12 +351,14 @@ function computeOpportunities(lifecycles, rates) {
     const staleCost = stale.reduce((s, lc) => s + (lc.totalCost || 0), 0);
     const byMat = {};
     for (const lc of stale) { byMat[lc.material] = (byMat[lc.material] || 0) + 1; }
+    // Stale trend: by entry month (when did these stale pallets arrive?)
+    const trend = byMonth(stale, lc => lc.entryDate);
     opps.push({
       id: "stale-inventory", severity: "high", category: "Inventory Velocity",
       title: `${stale.length.toLocaleString()} open pallets with 90+ day dwell`,
       subtitle: "Industry benchmark for frozen distribution is 30-45 day average dwell. Pallets beyond 90 days are accumulating renewal cycles and may indicate demand planning gaps.",
       metric: staleCost, metricLabel: "accrued cost on stale pallets",
-      detail: stale, byLoc: {},
+      detail: stale, byLoc: {}, trend,
       recommendation: "Review materials with high stale counts. Consider markdown, reallocation, or write-off to stop the renewal bleed.",
       topMaterials: Object.entries(byMat).sort((a, b) => b[1] - a[1]).slice(0, 10),
     });
@@ -397,8 +418,9 @@ function computeOpportunities(lifecycles, rates) {
     });
   }
 
-  // 6. Dwell benchmarking by location
+  // 6. Dwell benchmarking by location (with monthly trend)
   const benchmarks = [];
+  const dwellTrend = {};
   for (const loc of Object.keys(OCS_LOCATIONS)) {
     const locLCs = lifecycles.filter(lc => lc.loc === loc && !lc.preExisting && lc.dwell != null && !lc.open);
     if (locLCs.length < 10) continue;
@@ -408,6 +430,20 @@ function computeOpportunities(lifecycles, rates) {
     const under30 = dwells.filter(d => d <= 30).length;
     const over60 = dwells.filter(d => d > 60).length;
     benchmarks.push({ loc, name: OCS_LOCATIONS[loc]?.name, median, p90, total: dwells.length, under30, under30Pct: (under30 / dwells.length * 100).toFixed(1), over60, over60Pct: (over60 / dwells.length * 100).toFixed(1) });
+
+    // Monthly median dwell for this location
+    const byMo = {};
+    for (const lc of locLCs) {
+      if (!lc.exitDate) continue;
+      const k = mKey(lc.exitDate);
+      if (!byMo[k]) byMo[k] = [];
+      byMo[k].push(lc.dwell);
+    }
+    for (const [k, dwArr] of Object.entries(byMo)) {
+      dwArr.sort((a, b) => a - b);
+      if (!dwellTrend[k]) dwellTrend[k] = { period: k };
+      dwellTrend[k][loc] = dwArr[Math.floor(dwArr.length / 2)];
+    }
   }
   if (benchmarks.length > 0) {
     opps.push({
@@ -415,6 +451,8 @@ function computeOpportunities(lifecycles, rates) {
       title: "Dwell time benchmarks by location",
       subtitle: "Industry target for frozen distribution: median dwell under 30 days, 90th percentile under 60 days. Locations exceeding these thresholds have inventory velocity issues.",
       benchmarks: benchmarks.sort((a, b) => b.median - a.median),
+      dwellTrend: Object.values(dwellTrend).sort((a, b) => a.period.localeCompare(b.period)),
+      trendLocs: benchmarks.map(b => b.loc),
     });
   }
 
@@ -749,6 +787,59 @@ export default function App() {
                   </div>
                 )}
 
+                {/* Monthly trend chart - shows for any opp with trend data */}
+                {opp.trend && opp.trend.length > 1 && (
+                  <div style={{ marginTop: 16, marginBottom: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: CV.navy, marginBottom: 8 }}>
+                      Monthly Trend {opp.id === "stale-inventory" ? "(by entry month of stale pallets)" : "(by exit month)"}
+                    </div>
+                    <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                      <div style={{ flex: "1 0 300px" }}>
+                        <ResponsiveContainer width="100%" height={180}>
+                          <BarChart data={opp.trend}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={CV.creamDark} />
+                            <XAxis dataKey="period" tick={{ fontSize: 9 }} angle={-45} textAnchor="end" height={40} />
+                            <YAxis tick={{ fontSize: 10 }} />
+                            <Tooltip />
+                            <Bar dataKey="count" name="Pallets" fill={opp.severity === "high" ? CV.red : CV.orange} radius={[3, 3, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <div style={{ flex: "1 0 300px" }}>
+                        <ResponsiveContainer width="100%" height={180}>
+                          <BarChart data={opp.trend}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={CV.creamDark} />
+                            <XAxis dataKey="period" tick={{ fontSize: 9 }} angle={-45} textAnchor="end" height={40} />
+                            <YAxis tick={{ fontSize: 10 }} tickFormatter={v => `$${(v / 1000).toFixed(0)}K`} />
+                            <Tooltip formatter={v => fmt$(v)} />
+                            <Bar dataKey="cost" name="Avoidable Cost" fill={CV.navy} radius={[3, 3, 0, 0]} />
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                    {opp.trend.length >= 3 && (() => {
+                      const last3 = opp.trend.slice(-3);
+                      const first3 = opp.trend.slice(0, 3);
+                      const recentAvg = last3.reduce((s, t) => s + t.count, 0) / last3.length;
+                      const earlyAvg = first3.reduce((s, t) => s + t.count, 0) / first3.length;
+                      const direction = recentAvg < earlyAvg ? "improving" : recentAvg > earlyAvg ? "worsening" : "stable";
+                      const pctChange = earlyAvg > 0 ? ((recentAvg - earlyAvg) / earlyAvg * 100).toFixed(0) : 0;
+                      return (
+                        <div style={{ marginTop: 8, padding: "8px 12px", borderRadius: 6,
+                          background: direction === "improving" ? "#E8F8ED" : direction === "worsening" ? "#FEEEEC" : CV.navyLight }}>
+                          <span style={{ fontSize: 12, fontWeight: 700,
+                            color: direction === "improving" ? CV.green : direction === "worsening" ? CV.red : CV.navy }}>
+                            {direction === "improving" ? "\u2193" : direction === "worsening" ? "\u2191" : "\u2192"} Trend: {direction}
+                          </span>
+                          <span style={{ fontSize: 11, color: "#666", marginLeft: 8 }}>
+                            Last 3 months avg: {recentAvg.toFixed(0)}/mo vs early avg: {earlyAvg.toFixed(0)}/mo ({pctChange > 0 ? "+" : ""}{pctChange}%)
+                          </span>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+
                 {/* Short dwell breakdown */}
                 {opp.id === "short-dwell" && opp.byLoc && (
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
@@ -838,6 +929,24 @@ export default function App() {
                     <div style={{ marginTop: 12, fontSize: 11, color: "#888", lineHeight: 1.5 }}>
                       Industry benchmarks for frozen distribution: Median dwell target is under 30 days. 90th percentile should be under 60 days. Over 20% of pallets exceeding 60 days indicates an inventory velocity problem.
                     </div>
+                    {opp.dwellTrend && opp.dwellTrend.length > 1 && (
+                      <div style={{ marginTop: 20 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: CV.navy, marginBottom: 8 }}>Monthly Median Dwell by Location (days)</div>
+                        <ResponsiveContainer width="100%" height={250}>
+                          <LineChart data={opp.dwellTrend.map(d => ({ ...d, target30: 30 }))}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={CV.creamDark} />
+                            <XAxis dataKey="period" tick={{ fontSize: 9 }} angle={-45} textAnchor="end" height={40} />
+                            <YAxis tick={{ fontSize: 10 }} />
+                            <Tooltip />
+                            <Legend />
+                            <Line type="monotone" dataKey="target30" name="30d target" stroke="#ccc" strokeDasharray="5 5" dot={false} strokeWidth={1} />
+                            {opp.trendLocs.map((loc, i) => (
+                              <Line key={loc} type="monotone" dataKey={loc} name={`${loc} (${OCS_LOCATIONS[loc]?.name})`} stroke={LOC_COLORS[i % LOC_COLORS.length]} strokeWidth={2} dot={{ r: 2 }} connectNulls />
+                            ))}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
                   </div>
                 )}
               </Card>
