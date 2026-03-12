@@ -129,41 +129,86 @@ function parseDetailLine(line) {
 }
 
 function isSummaryPage(text) {
-  // Summary pages have charge summary lines with $ and typically contain "Invoice Number" or "Selected Through"
-  const hasCharges = /\$\s*[\d,]+\.\d{2}/.test(text);
-  const hasInvMarker = /Selected Through|Invoice\s*(Number|Date)/i.test(text);
-  const hasDetailLines = (text.match(/^\d{2}\/\d{2}\/\d{4}\s+\d{5}/gm) || []).length;
-  // Summary pages have few detail lines (maybe 0), detail pages have many
-  return (hasCharges && hasInvMarker) || (hasCharges && hasDetailLines < 3);
+  // A summary page must have BOTH an invoice marker AND charge summary lines
+  // Detail pages may have $ amounts but won't have the invoice header markers
+  const hasInvMarker = /Selected Through|Invoice\s*(Number|Date|#)|North American Cold Storage/i.test(text);
+  
+  // Check for summary-style charge lines: description + quantity + $ amounts
+  const chargeLinesCount = (text.match(/\$\s*[\d,]+\.\d{2}/g) || []).length;
+  const hasChargeTable = chargeLinesCount >= 3; // Summary pages have multiple charge lines
+  
+  // Detail pages have many PID lines (F + digits)
+  const pidCount = (text.match(/\bF\d{5,8}\b/g) || []).length;
+  
+  // Summary = has invoice markers + charge table + few PIDs
+  // Detail = many PIDs, possibly some $ amounts but no invoice markers
+  const isSummary = hasInvMarker && hasChargeTable && pidCount < 10;
+  
+  return isSummary;
 }
 
 function buildInvoiceResult(summary, detailLines, parseErrors) {
-  const chargeMap = {};
-  for (const dl of detailLines) {
-    const key = dl.codeKey || dl.chargeCodeRaw;
-    if (!chargeMap[key]) chargeMap[key] = { lines: [], totalExtension: 0, pallets: 0 };
-    chargeMap[key].lines.push(dl);
-    chargeMap[key].totalExtension += dl.extension;
-    chargeMap[key].pallets += dl.qty;
+  // Primary source: summary page charges (rolled-up totals per category)
+  // Secondary source: detail lines (pallet-level, used for drill-down only)
+  
+  let lineItems = [];
+  let storageCharge = 0, handlingCharge = 0, assessorialsTotal = 0;
+  let palletsBilled = 0;
+
+  if (summary.summaryCharges && summary.summaryCharges.length > 0) {
+    // Use summary charges as the authoritative source
+    console.log("[NACS] Using summary charges:", summary.summaryCharges.length, "line items");
+    for (const sc of summary.summaryCharges) {
+      const contracted = sc.codeKey ? CONTRACTED_RATES[sc.codeKey] : null;
+      const category = contracted?.category || (sc.rawDescription.match(/storage|renewal|initial/i) ? "storage" : sc.rawDescription.match(/handling/i) ? "handling" : "assessorial");
+      
+      lineItems.push({
+        chargeCode: sc.codeKey || sc.rawDescription,
+        label: contracted?.label || sc.rawDescription,
+        category,
+        pallets: sc.quantity,
+        billedRate: sc.unitRate,
+        contractedRate: contracted?.contracted ?? null,
+        rateVariance: (sc.unitRate != null && contracted?.contracted != null) ? parseFloat((sc.unitRate - contracted.contracted).toFixed(4)) : null,
+        extension: sc.extension,
+      });
+
+      if (category === "storage") { storageCharge += sc.extension; palletsBilled += sc.quantity; }
+      else if (category === "handling") handlingCharge += sc.extension;
+      else assessorialsTotal += sc.extension;
+    }
+  } else if (detailLines.length > 0) {
+    // Fallback: aggregate from detail lines
+    console.log("[NACS] No summary charges, using", detailLines.length, "detail lines");
+    const chargeMap = {};
+    for (const dl of detailLines) {
+      const key = dl.codeKey || dl.chargeCodeRaw;
+      if (!chargeMap[key]) chargeMap[key] = { lines: [], totalExtension: 0, pallets: 0 };
+      chargeMap[key].lines.push(dl);
+      chargeMap[key].totalExtension += dl.extension;
+      chargeMap[key].pallets += dl.qty;
+    }
+
+    lineItems = Object.entries(chargeMap).map(([key, data]) => {
+      const contracted = CONTRACTED_RATES[key];
+      const billedRate = data.lines[0]?.rate ?? null;
+      const contractedRate = contracted?.contracted ?? null;
+      const rateVariance = (billedRate != null && contractedRate != null) ? parseFloat((billedRate - contractedRate).toFixed(4)) : null;
+      return { chargeCode: key, label: contracted?.label ?? key, category: contracted?.category ?? "other", pallets: data.pallets, billedRate, contractedRate, rateVariance, extension: parseFloat(data.totalExtension.toFixed(2)) };
+    });
+
+    storageCharge = lineItems.filter(l => l.category === "storage").reduce((s, l) => s + l.extension, 0);
+    handlingCharge = lineItems.filter(l => l.category === "handling").reduce((s, l) => s + l.extension, 0);
+    assessorialsTotal = lineItems.filter(l => l.category === "assessorial").reduce((s, l) => s + l.extension, 0);
+    palletsBilled = lineItems.filter(l => l.category === "storage").reduce((s, l) => s + l.pallets, 0);
   }
 
-  const lineItems = Object.entries(chargeMap).map(([key, data]) => {
-    const contracted = CONTRACTED_RATES[key];
-    const billedRate = data.lines[0]?.rate ?? null;
-    const contractedRate = contracted?.contracted ?? null;
-    const rateVariance = (billedRate != null && contractedRate != null) ? parseFloat((billedRate - contractedRate).toFixed(4)) : null;
-    return { chargeCode: key, label: contracted?.label ?? key, category: contracted?.category ?? "other", pallets: data.pallets, billedRate, contractedRate, rateVariance, extension: parseFloat(data.totalExtension.toFixed(2)) };
-  });
-
-  const storageCharge = lineItems.filter(l => l.category === "storage").reduce((s, l) => s + l.extension, 0);
-  const handlingCharge = lineItems.filter(l => l.category === "handling").reduce((s, l) => s + l.extension, 0);
-  const assessorialsTotal = lineItems.filter(l => l.category === "assessorial").reduce((s, l) => s + l.extension, 0);
   const computedTotal = parseFloat((storageCharge + handlingCharge + assessorialsTotal).toFixed(2));
 
   let billingPeriod = null;
   if (summary.invoiceDate) {
     const parts = summary.invoiceDate.split("/");
-    if (parts.length === 3) billingPeriod = `${parts[2]}-${parts[0]}`;
+    if (parts.length === 3) billingPeriod = `${parts[2]}-${parts[0].padStart(2, "0")}`;
   }
 
   return {
@@ -179,7 +224,7 @@ function buildInvoiceResult(summary, detailLines, parseErrors) {
     total: computedTotal,
     invoicedTotal: summary.invoiceTotal,
     totalVariance: summary.invoiceTotal != null ? parseFloat((computedTotal - summary.invoiceTotal).toFixed(2)) : null,
-    palletsBilled: (chargeMap["Renewal"]?.pallets ?? 0) + (chargeMap["Initial Storage"]?.pallets ?? 0),
+    palletsBilled,
     lineItems,
     detailLines: detailLines.length,
     parseErrors: parseErrors.length,
