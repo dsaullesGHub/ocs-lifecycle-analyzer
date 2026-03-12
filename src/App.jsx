@@ -1,6 +1,8 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import * as XLSX from "xlsx";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from "recharts";
+import InvoicesTab from "./tabs/InvoicesTab.jsx";
+import ReconciliationTab from "./tabs/ReconciliationTab.jsx";
 
 // ── IndexedDB Persistence ────────────────────────────────────────────────────
 const DB_NAME = "ocs-lifecycle-db";
@@ -65,12 +67,13 @@ async function clearProject() {
   } catch (e) { console.warn("Clear failed:", e); return false; }
 }
 
-function exportProjectFile(rawTx, loadedFiles, rates) {
+function exportProjectFile(rawTx, loadedFiles, rates, invoices) {
   const data = {
-    version: 2,
+    version: 3,
     exportedAt: new Date().toISOString(),
     loadedFiles,
     rates,
+    invoices: invoices || [],
     rawTx: rawTx.map(tx => ({ ...tx, ts: tx.ts.getTime() })),
   };
   const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
@@ -87,6 +90,7 @@ async function importProjectFile(file) {
   return {
     loadedFiles: data.loadedFiles,
     rates: data.rates || { ...DEFAULT_RATES },
+    invoices: data.invoices || [],
     rawTx: data.rawTx.map(tx => ({ ...tx, ts: new Date(tx.ts) })),
   };
 }
@@ -471,6 +475,7 @@ export default function App() {
   const [rates, setRates] = useState({ ...DEFAULT_RATES });
   const [tab, setTab] = useState("overview");
   const [search, setSearch] = useState("");
+  const [invoiceData, setInvoiceData] = useState([]);
   const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", vendors: [], locations: [], materialSearch: "", statusFilter: "" });
   const [drillMat, setDrillMat] = useState(null);
   const [drillLoc, setDrillLoc] = useState(null);
@@ -498,18 +503,19 @@ export default function App() {
     if (!rawTx.length || !loadedFiles.length) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      saveProject({ rawTx, loadedFiles, rates }).then(ok => {
+      saveProject({ rawTx, loadedFiles, rates, invoices: invoiceData }).then(ok => {
         if (ok) setLastSaved(new Date());
       });
     }, 2000);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [rawTx, loadedFiles, rates]);
+  }, [rawTx, loadedFiles, rates, invoiceData]);
 
   const restoreSaved = useCallback(() => {
     if (!savedProject) return;
     setRawTx(savedProject.rawTx);
     setLoadedFiles(savedProject.loadedFiles);
     if (savedProject.rates) setRates(savedProject.rates);
+    if (savedProject.invoices) setInvoiceData(savedProject.invoices);
     setLifecycles(rebuildFromTransactions(savedProject.rawTx, savedProject.rates || rates));
     setSavedProject(null);
   }, [savedProject, rates]);
@@ -521,6 +527,7 @@ export default function App() {
     try {
       const data = await importProjectFile(file);
       setRawTx(data.rawTx); setLoadedFiles(data.loadedFiles); setRates(data.rates);
+      if (data.invoices) setInvoiceData(data.invoices);
       setProgress("Building lifecycles..."); await new Promise(r => setTimeout(r, 50));
       setLifecycles(rebuildFromTransactions(data.rawTx, data.rates));
       setProgress(""); setProcessing(false);
@@ -548,7 +555,7 @@ export default function App() {
       setProgress(""); setProcessing(false);
     } catch (err) { setProgress(`Error: ${err.message}`); setProcessing(false); }
   }, [rawTx, loadedFiles, rates]);
-  const reset = useCallback(() => { setLoadedFiles([]); setRawTx([]); setLifecycles(null); setTab("overview"); setProgress(""); setDrillMat(null); setDrillLoc(null); setLastSaved(null); clearProject(); }, []);
+  const reset = useCallback(() => { setLoadedFiles([]); setRawTx([]); setLifecycles(null); setInvoiceData([]); setTab("overview"); setProgress(""); setDrillMat(null); setDrillLoc(null); setLastSaved(null); clearProject(); }, []);
 
   const costed = useMemo(() => lifecycles ? computeCosts(lifecycles, rates) : null, [lifecycles, rates]);
   const filtered = useMemo(() => {
@@ -679,7 +686,7 @@ export default function App() {
     );
   }
 
-  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
+  const TABS = [{ k: "overview", l: "Overview" }, { k: "onhand", l: "On Hand" }, { k: "throughput", l: "Throughput" }, { k: "costs", l: "Cost Trends" }, { k: "aging", l: "Aging" }, { k: "opportunities", l: "Opportunities" }, { k: "invoices", l: "Invoices" }, { k: "reconciliation", l: "Reconciliation" }, { k: "vendors", l: "Vendors" }, { k: "materials", l: "Materials" }, { k: "locations", l: "Locations" }, { k: "search", l: "Search" }, { k: "rates", l: "Rates" }];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream, color: CV.navy }}>
@@ -693,7 +700,7 @@ export default function App() {
           <input ref={addRef} type="file" accept=".xlsx,.xls" multiple style={{ display: "none" }} onChange={e => { addFile(e.target.files, true); e.target.value = ""; }} />
           <button onClick={() => addRef.current?.click()} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>+ File</button>
           <button onClick={() => exportCSV(filtered)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>CSV</button>
-          <button onClick={() => exportProjectFile(rawTx, loadedFiles, rates)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>Save Project</button>
+          <button onClick={() => exportProjectFile(rawTx, loadedFiles, rates, invoiceData)} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#fff", background: "transparent" }}>Save Project</button>
           <button onClick={reset} style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "rgba(255,255,255,0.5)", background: "transparent" }}>Reset</button>
           {lastSaved && <span style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", alignSelf: "center" }}>auto-saved {lastSaved.toLocaleTimeString()}</span>}
         </div>
@@ -702,7 +709,7 @@ export default function App() {
         {TABS.map(t => <button key={t.k} onClick={() => { setTab(t.k); setDrillMat(null); setDrillLoc(null); }} style={{ padding: "10px 16px", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600, background: "transparent", color: tab === t.k ? CV.navy : "#999", borderBottom: tab === t.k ? `3px solid ${CV.red}` : "3px solid transparent" }}>{t.l}</button>)}
       </div>
       <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-        {!["rates", "search"].includes(tab) && costed && <FilterBar filters={filters} setFilters={setFilters} lifecycles={costed} />}
+        {!["rates", "search", "invoices", "reconciliation"].includes(tab) && costed && <FilterBar filters={filters} setFilters={setFilters} lifecycles={costed} />}
 
         {tab === "overview" && <>
           <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
@@ -1002,6 +1009,10 @@ export default function App() {
           {searchRes.length > 0 && <Card style={{ padding: 0, overflow: "hidden" }}><div style={{ padding: "10px 14px", fontSize: 11, color: "#888", borderBottom: `1px solid ${CV.cream}` }}>{searchRes.length >= 500 ? "500+" : searchRes.length} results</div><div style={{ overflowX: "auto", maxHeight: 600, overflowY: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 1000 }}><thead><tr style={{ background: CV.navy }}>{["Pallet", "Loc", "Vendor", "Material", "Lot", "Qty", "Entry", "Exit", "Dwell", "Status", "Cost"].map(h => <th key={h} style={{ padding: "8px", textAlign: "left", color: "#fff", fontWeight: 700, fontSize: 9 }}>{h}</th>)}</tr></thead><tbody>{searchRes.map((l, i) => <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : CV.cream }}><td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{l.pallet}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.loc}</td><td style={{ padding: "5px 8px" }}>{OCS_LOCATIONS[l.loc]?.vendor}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.material}</td><td style={{ padding: "5px 8px", fontFamily: "monospace", fontSize: 10 }}>{l.mfgLot}</td><td style={{ padding: "5px 8px" }}>{l.qty}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.entryDate)}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.exitDate)}</td><td style={{ padding: "5px 8px", fontWeight: 600 }}>{l.dwell != null ? `${l.dwell}d` : "---"}</td><td style={{ padding: "5px 8px" }}>{l.open ? <Badge bg="#E8F8ED" color={CV.green}>Open</Badge> : l.preExisting ? <Badge bg="#FEF3E2" color={CV.orange}>Pre-Ex</Badge> : <Badge bg="#F0F0F0" color="#999">Closed</Badge>}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.totalCost > 0 ? fmt$(l.totalCost) : "---"}</td></tr>)}</tbody></table></div></Card>}
           {search.length >= 3 && !searchRes.length && <div style={{ padding: 32, textAlign: "center", color: "#aaa" }}>No results</div>}
         </>}
+
+        {tab === "invoices" && <InvoicesTab invoices={invoiceData} setInvoices={setInvoiceData} />}
+
+        {tab === "reconciliation" && <ReconciliationTab invoices={invoiceData} lifecycles={costed} />}
 
         {tab === "rates" && <>
           <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 800 }}>Rate Cards</h2>
