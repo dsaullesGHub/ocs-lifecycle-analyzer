@@ -437,8 +437,9 @@ export default function App() {
   const [drillMat, setDrillMat] = useState(null);
   const [drillLoc, setDrillLoc] = useState(null);
   const [ohGran, setOhGran] = useState("week");
-  const [savedProject, setSavedProject] = useState(undefined);
+  const [savedProject, setSavedProject] = useState(null);
   const [lastSaved, setLastSaved] = useState(null);
+  const [checkedDB, setCheckedDB] = useState(false);
   const [dragging, setDragging] = useState(false);
   const fileRef = useRef(null);
   const addRef = useRef(null);
@@ -448,8 +449,9 @@ export default function App() {
   // Check for saved project on mount
   useEffect(() => {
     loadProject().then(data => {
-      setSavedProject(data || null);
-    }).catch(() => setSavedProject(null));
+      if (data && data.rawTx && data.rawTx.length > 0) setSavedProject(data);
+      setCheckedDB(true);
+    }).catch(() => setCheckedDB(true));
   }, []);
 
   // Auto-save whenever raw transactions or rates change (debounced)
@@ -546,12 +548,6 @@ export default function App() {
   // Landing
   if (!lifecycles) {
     const exp = ["WMS_1.xlsx", "WMS_2.xlsx", "WMS_DATA_2026YTD.xlsx"];
-    // Still checking for saved project
-    if (savedProject === undefined) return (
-      <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream }}>
-        <div style={{ fontSize: 13, color: "#888" }}>Loading...</div>
-      </div>
-    );
     return (
       <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, sans-serif", background: CV.cream }}>
         <div style={{ maxWidth: 560, width: "100%" }}>
@@ -562,7 +558,7 @@ export default function App() {
           </div>
 
           {/* Saved project banner */}
-          {savedProject && !loadedFiles.length && (
+          {checkedDB && savedProject && !loadedFiles.length && (
             <div style={{ background: "#fff", borderRadius: 12, padding: "20px 24px", border: `2px solid ${CV.green}`, marginBottom: 20 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
                 <div style={{ width: 32, height: 32, borderRadius: "50%", background: CV.green, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 800 }}>{"\u21BB"}</div>
@@ -615,7 +611,7 @@ export default function App() {
               }}
               onClick={() => fileRef.current?.click()}
             >
-              <div style={{ fontSize: 24, marginBottom: 8, opacity: 0.4 }}>{dragging ? "\u2B07" : "\u{1F4C1}"}</div>
+              <div style={{ fontSize: 24, marginBottom: 8, opacity: 0.4 }}>{dragging ? "\u2B07" : "\u2193"}</div>
               <div style={{ fontSize: 13, fontWeight: 600, color: dragging ? CV.teal : CV.navy }}>
                 {dragging ? "Drop files here" : "Drag and drop WMS files here"}
               </div>
