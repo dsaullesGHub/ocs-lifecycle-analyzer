@@ -145,19 +145,101 @@ function parseExcelDate(v) {
 }
 
 function buildLifecycles(transactions, asOfDate) {
+  // ── Balance-tracking lifecycle builder ──
+  // Groups all transactions by pallet+loc, replays in timestamp order,
+  // maintains running balance, detects lifecycle open/close boundaries.
   const groups = {};
-  for (const tx of transactions) { const key = `${tx.pallet}|${tx.loc}`; if (!groups[key]) groups[key] = { entries: [], exits: [] }; if (tx.event === "entry") groups[key].entries.push(tx); else groups[key].exits.push(tx); }
+  for (const tx of transactions) {
+    const key = `${tx.pallet}|${tx.loc}`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(tx);
+  }
   const lifecycles = [];
   for (const key of Object.keys(groups)) {
-    const [pallet, loc] = key.split("|"); const g = groups[key]; g.entries.sort((a, b) => a.ts - b.ts); g.exits.sort((a, b) => a.ts - b.ts);
-    let ei = 0, xi = 0;
-    while (ei < g.entries.length) {
-      const entry = g.entries[ei]; while (xi < g.exits.length && g.exits[xi].ts <= entry.ts) xi++;
-      const exit = xi < g.exits.length ? g.exits[xi] : null; const dwell = exit ? daysBetween(entry.ts, exit.ts) : daysBetween(entry.ts, asOfDate);
-      lifecycles.push({ pallet, loc, material: entry.material, qty: entry.qty, entryDate: entry.ts, exitDate: exit?.ts || null, entryFrom: entry.whsFrom, exitTo: exit?.whsTo || null, dwell: Math.max(dwell, 0), open: !exit, preExisting: false, mfgLot: entry.mfgLot || "" });
-      ei++; if (exit) xi++;
+    const [pallet, loc] = key.split("|");
+    const txns = groups[key].sort((a, b) => a.ts - b.ts);
+    let balance = 0, cur = null;
+
+    for (const tx of txns) {
+      const delta = tx.balanceDelta ?? (tx.event === "entry" ? tx.qty : -Math.abs(tx.qty));
+      const prevBal = balance;
+      balance += delta;
+
+      // Lifecycle opens: balance goes from <=0 to positive
+      if (prevBal <= 0 && balance > 0 && !cur) {
+        cur = {
+          pallet, loc, material: tx.material, qty: balance,
+          entryDate: tx.ts, entryFrom: tx.whsFrom || "", entryType: tx.eventType || tx.event,
+          mfgLot: tx.mfgLot || "", peakQty: balance,
+          exitEvents: [], qtyPicked: 0, qtyAdjusted: 0, qtyShipped: 0, qtyTransferred: 0,
+        };
+      }
+
+      // Track peak qty
+      if (cur && balance > cur.peakQty) cur.peakQty = balance;
+
+      // Track depleting events
+      if (cur && delta < 0) {
+        cur.exitEvents.push(tx);
+        const absD = Math.abs(delta);
+        if (tx.eventType === "case-pick") cur.qtyPicked += absD;
+        else if (tx.eventType === "adjustment") cur.qtyAdjusted += absD;
+        else if (tx.eventType === "exit-ship") cur.qtyShipped += absD;
+        else if (tx.eventType === "exit-transfer") cur.qtyTransferred += absD;
+      }
+
+      // Lifecycle closes: balance returns to 0 or below
+      if (balance <= 0 && cur) {
+        const exitTx = cur.exitEvents.length > 0 ? cur.exitEvents[cur.exitEvents.length - 1] : tx;
+        const dwell = daysBetween(cur.entryDate, exitTx.ts);
+        // Classify exit reason
+        const eTypes = new Set(cur.exitEvents.map(e => e.eventType));
+        let exitReason = "unknown";
+        if (eTypes.has("exit-ship")) exitReason = "shipped";
+        else if (eTypes.has("exit-transfer")) exitReason = "transferred";
+        else if (eTypes.has("case-pick") || eTypes.has("adjustment")) exitReason = "depleted";
+
+        lifecycles.push({
+          ...cur, exitDate: exitTx.ts, exitTo: exitTx.whsTo || exitTx.whsFrom || "",
+          exitType: exitTx.eventType || "", exitReason,
+          dwell: Math.max(dwell, 0), open: false, preExisting: false,
+        });
+        cur = null; balance = 0; // reset for potential re-entry
+      }
     }
-    if (g.exits.length > g.entries.length) { for (let i = 0; i < g.exits.length - g.entries.length; i++) { const exit = g.exits[i]; lifecycles.push({ pallet, loc, material: exit.material, qty: exit.qty, entryDate: null, exitDate: exit.ts, entryFrom: "PRE-EXISTING", exitTo: exit.whsTo, dwell: null, open: false, preExisting: true, mfgLot: exit.mfgLot || "" }); } }
+
+    // Still open at end of data window
+    if (cur) {
+      const dwell = daysBetween(cur.entryDate, asOfDate);
+      lifecycles.push({
+        ...cur, exitDate: null, exitTo: null, exitType: null, exitReason: null,
+        dwell: Math.max(dwell, 0), open: true, preExisting: false,
+      });
+    }
+
+    // Pre-existing: if first transaction is depleting with no prior entry, balance starts negative
+    // This means exits happened before any entry in our data window
+    if (txns.length > 0 && txns[0].event === "exit" && !lifecycles.some(l => l.pallet === pallet && l.loc === loc && !l.preExisting)) {
+      // Collect all exit events that had no matching entry
+      const preExTxns = [];
+      let preBal = 0;
+      for (const tx of txns) {
+        const delta = tx.balanceDelta ?? (tx.event === "entry" ? tx.qty : -Math.abs(tx.qty));
+        preBal += delta;
+        if (preBal < 0 && tx.event === "exit") preExTxns.push(tx);
+        if (preBal >= 0) break;
+      }
+      if (preExTxns.length > 0) {
+        const lastExit = preExTxns[preExTxns.length - 1];
+        lifecycles.push({
+          pallet, loc, material: lastExit.material, qty: lastExit.qty, mfgLot: lastExit.mfgLot || "",
+          entryDate: null, exitDate: lastExit.ts, entryFrom: "PRE-EXISTING", exitTo: lastExit.whsTo || "",
+          entryType: null, exitType: lastExit.eventType || "", exitReason: "pre-existing",
+          dwell: null, open: false, preExisting: true, peakQty: 0,
+          exitEvents: [], qtyPicked: 0, qtyAdjusted: 0, qtyShipped: 0, qtyTransferred: 0,
+        });
+      }
+    }
   }
   return lifecycles;
 }
@@ -189,10 +271,37 @@ async function parseFileToTransactions(file, setProgress) {
       const txn = String(row["Txn. Type"] || "").trim(), whs = String(row["Whs."] || "").trim(), whsTo = String(row["Whs. To"] || "").trim();
       const pallet = String(row["Pallet"] || "").trim(), material = String(row["Material"] || "").trim(), qty = parseInt(row["Qty"]) || 0;
       const mfgLot = String(row["MFG Lot"] || row["Mfg Lot"] || "").trim();
+      const palletTo = String(row["Pallet To"] || "").trim();
+      const order = String(row["Order#"] || "").trim();
       let ts = row["Timestamp"]; if (ts && !(ts instanceof Date)) { const num = parseFloat(ts); if (!isNaN(num) && num > 10000) ts = parseExcelDate(num); else { ts = new Date(ts); if (isNaN(ts.getTime())) ts = null; } }
       if (!ts || isNaN(ts.getTime()) || !pallet || pallet === "NONE") continue;
-      if ((txn === "RCP" || txn === "STG") && OCS_CODES.has(whsTo)) transactions.push({ event: "entry", loc: whsTo, pallet, material, qty, ts, mfgLot, whsFrom: whs, whsTo });
-      else if (txn === "SHP" && OCS_CODES.has(whs)) transactions.push({ event: "exit", loc: whs, pallet, material, qty, ts, mfgLot, whsFrom: whs, whsTo });
+      const base = { pallet, material, qty, ts, mfgLot, whsFrom: whs, whsTo, palletTo, order };
+      const whsIsOCS = OCS_CODES.has(whs), whsToIsOCS = OCS_CODES.has(whsTo);
+
+      // RCP/STG into OCS location = entry
+      if ((txn === "RCP" || txn === "STG") && whsToIsOCS) {
+        transactions.push({ ...base, event: "entry", eventType: "entry", loc: whsTo, balanceDelta: qty });
+      }
+      // SHP from OCS location = exit (whole pallet ship)
+      else if (txn === "SHP" && whsIsOCS) {
+        transactions.push({ ...base, event: "exit", eventType: "exit-ship", loc: whs, balanceDelta: -Math.abs(qty) });
+      }
+      // MOV from OCS to non-OCS = exit-transfer (e.g., C1 to hold warehouse I)
+      else if (txn === "MOV" && whsIsOCS && !whsToIsOCS && whsTo && whs !== whsTo) {
+        transactions.push({ ...base, event: "exit", eventType: "exit-transfer", loc: whs, balanceDelta: -Math.abs(qty) });
+      }
+      // MOV from non-OCS to OCS = entry-transfer (e.g., hold I back to C1)
+      else if (txn === "MOV" && !whsIsOCS && whsToIsOCS && whs !== whsTo) {
+        transactions.push({ ...base, event: "entry", eventType: "entry-transfer", loc: whsTo, balanceDelta: qty });
+      }
+      // PCK at OCS where Pallet To is a DIFFERENT pallet = case pick (depletion)
+      else if (txn === "PCK" && whsIsOCS && palletTo && palletTo !== pallet && palletTo !== "NONE" && palletTo !== "NOBREAK") {
+        transactions.push({ ...base, event: "exit", eventType: "case-pick", loc: whs, balanceDelta: -Math.abs(qty) });
+      }
+      // ADJ at OCS location = inventory adjustment (signed qty)
+      else if (txn === "ADJ" && whsIsOCS) {
+        transactions.push({ ...base, event: qty < 0 ? "exit" : "entry", eventType: "adjustment", loc: whs, balanceDelta: qty });
+      }
     }
   }
   return { transactions, totalRows };
@@ -201,26 +310,32 @@ async function parseFileToTransactions(file, setProgress) {
 function rebuildFromTransactions(allTx, rates) {
   // ── STEP 1: Cross-file entry dedup at DAY level ──
   // Catches both cross-file overlaps AND STG+BATCH pairs on the same pallet/loc/date.
-  // Prior implementation used 5-minute windows which missed BATCH events 6+ min after STG.
   const entryMap = {};
   for (const tx of allTx) {
     if (tx.event !== "entry") continue;
     const dayKey = `${tx.pallet}|${tx.loc}|${Math.floor(tx.ts.getTime() / 86400000)}`;
     if (!entryMap[dayKey]) entryMap[dayKey] = tx;
-    // If collision, keep earliest timestamp (STG typically precedes BATCH)
     else if (tx.ts < entryMap[dayKey].ts) entryMap[dayKey] = tx;
   }
   const dedupedEntries = Object.values(entryMap);
   const entryDupsRemoved = allTx.filter(t => t.event === "entry").length - dedupedEntries.length;
 
   // ── STEP 2: Cross-file exit dedup at MINUTE level ──
+  // Only dedup SHP and exit-transfer (cross-file duplicate risk).
+  // Case-picks and adjustments are NOT deduped: multiple PCK/ADJ in the same
+  // minute are legitimate separate transactions (e.g., 3 cases + 28 cases).
   const exitMap = {};
+  const exitKeep = [];
   for (const tx of allTx) {
     if (tx.event !== "exit") continue;
-    const minKey = `${tx.pallet}|${tx.loc}|${Math.floor(tx.ts.getTime() / 60000)}`;
-    if (!exitMap[minKey]) exitMap[minKey] = tx;
+    if (tx.eventType === "exit-ship" || tx.eventType === "exit-transfer") {
+      const minKey = `${tx.pallet}|${tx.loc}|${tx.eventType}|${Math.floor(tx.ts.getTime() / 60000)}`;
+      if (!exitMap[minKey]) exitMap[minKey] = tx;
+    } else {
+      exitKeep.push(tx); // case-pick, adjustment: keep all
+    }
   }
-  const dedupedExits = Object.values(exitMap);
+  const dedupedExits = [...Object.values(exitMap), ...exitKeep];
   const exitDupsRemoved = allTx.filter(t => t.event === "exit").length - dedupedExits.length;
 
   // ── Build lifecycles from clean transactions ──
@@ -236,7 +351,7 @@ function rebuildFromTransactions(allTx, rates) {
     entryDupsRemoved,
     exitDupsRemoved,
     totalRemoved: entryDupsRemoved + exitDupsRemoved,
-    phantomsEliminated: entryDupsRemoved, // each removed entry = one fewer potential phantom open record
+    phantomsEliminated: entryDupsRemoved,
   };
   return lifecycles;
 }
@@ -299,12 +414,20 @@ function computeMaterials(lcs) {
 }
 
 function exportCSV(lcs) {
-  const h = ["Pallet", "Location", "Vendor", "Material", "MfgLot", "Qty", "EntryDate", "ExitDate", "DwellDays", "Open", "PreExisting", "EntryFrom", "ExitTo", "Handling", "InitialStorage", "RenewalStorage", "RenewalCycles", "TotalCost"];
-  const r = lcs.map(l => [l.pallet, l.loc, OCS_LOCATIONS[l.loc]?.vendor || "", l.material, l.mfgLot, l.qty, fmtISO(l.entryDate), fmtISO(l.exitDate), l.dwell ?? "", l.open ? "Y" : "N", l.preExisting ? "Y" : "N", l.entryFrom || "", l.exitTo || "", l.handling?.toFixed(2) || "0", l.initialStorage?.toFixed(2) || "0", l.renewalStorage?.toFixed(2) || "0", l.renewalCycles ?? 0, l.totalCost?.toFixed(2) || "0"]);
+  const h = ["Pallet", "Location", "Vendor", "Material", "MfgLot", "Qty", "PeakQty", "EntryDate", "ExitDate", "DwellDays", "Open", "PreExisting", "ExitReason", "EntryFrom", "ExitTo", "Handling", "InitialStorage", "RenewalStorage", "RenewalCycles", "TotalCost", "QtyShipped", "QtyPicked", "QtyAdjusted", "QtyTransferred"];
+  const r = lcs.map(l => [l.pallet, l.loc, OCS_LOCATIONS[l.loc]?.vendor || "", l.material, l.mfgLot, l.qty, l.peakQty ?? "", fmtISO(l.entryDate), fmtISO(l.exitDate), l.dwell ?? "", l.open ? "Y" : "N", l.preExisting ? "Y" : "N", l.exitReason || "", l.entryFrom || "", l.exitTo || "", l.handling?.toFixed(2) || "0", l.initialStorage?.toFixed(2) || "0", l.renewalStorage?.toFixed(2) || "0", l.renewalCycles ?? 0, l.totalCost?.toFixed(2) || "0", l.qtyShipped ?? "", l.qtyPicked ?? "", l.qtyAdjusted ?? "", l.qtyTransferred ?? ""]);
   const csv = [h, ...r].map(x => x.map(c => `"${c}"`).join(",")).join("\n"); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "ocs_lifecycle_export.csv"; a.click();
 }
 
 function Badge({ bg, color, children }) { return <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 99, background: bg, color, whiteSpace: "nowrap" }}>{children}</span>; }
+function StatusBadge({ lc }) {
+  if (lc.open) return <Badge bg="#E8F8ED" color={CV.green}>Open</Badge>;
+  if (lc.preExisting) return <Badge bg="#FEF3E2" color={CV.orange}>Pre-Ex</Badge>;
+  if (lc.exitReason === "depleted") return <Badge bg="#FDE8E8" color="#B44">Depleted</Badge>;
+  if (lc.exitReason === "transferred") return <Badge bg="#E0F6FA" color={CV.teal}>Transferred</Badge>;
+  if (lc.exitReason === "shipped") return <Badge bg="#F0F0F0" color="#999">Shipped</Badge>;
+  return <Badge bg="#F0F0F0" color="#999">Closed</Badge>;
+}
 function Card({ children, style }) { return <div style={{ background: "#fff", borderRadius: 12, padding: "20px 24px", border: `1px solid ${CV.creamDark}`, ...style }}>{children}</div>; }
 function SectionTitle({ children }) { return <h3 style={{ margin: "0 0 14px", fontSize: 13, fontWeight: 700, color: CV.navy, textTransform: "uppercase", letterSpacing: "0.05em" }}>{children}</h3>; }
 function KPI({ label, value, color, sub }) { return (<div style={{ flex: "1 0 130px", background: "#fff", borderRadius: 10, padding: "14px 16px", border: `1px solid ${CV.creamDark}` }}><div style={{ fontSize: 22, fontWeight: 800, color: color || CV.navy }}>{value}</div><div style={{ fontSize: 10, fontWeight: 600, color: "#999", textTransform: "uppercase", marginTop: 2 }}>{label}</div>{sub && <div style={{ fontSize: 10, color: "#bbb", marginTop: 2 }}>{sub}</div>}</div>); }
@@ -327,6 +450,8 @@ function FilterBar({ filters, setFilters, lifecycles }) {
       <input type="text" placeholder="Material #" value={filters.materialSearch} onChange={e => setFilters({ ...filters, materialSearch: e.target.value })} style={{ ...inp, width: 90 }} />
       <button style={pill(filters.statusFilter === "open")} onClick={() => setFilters({ ...filters, statusFilter: filters.statusFilter === "open" ? "" : "open" })}>Open</button>
       <button style={pill(filters.statusFilter === "closed")} onClick={() => setFilters({ ...filters, statusFilter: filters.statusFilter === "closed" ? "" : "closed" })}>Closed</button>
+      <button style={pill(filters.statusFilter === "depleted")} onClick={() => setFilters({ ...filters, statusFilter: filters.statusFilter === "depleted" ? "" : "depleted" })}>Depleted</button>
+      <button style={pill(filters.statusFilter === "transferred")} onClick={() => setFilters({ ...filters, statusFilter: filters.statusFilter === "transferred" ? "" : "transferred" })}>Transferred</button>
       {has && <button onClick={() => setFilters({ dateFrom: "", dateTo: "", vendors: [], locations: [], materialSearch: "", statusFilter: "" })} style={{ padding: "4px 10px", borderRadius: 99, border: `1px solid ${CV.red}`, cursor: "pointer", fontSize: 10, fontWeight: 700, background: "#fff", color: CV.red }}>Clear</button>}
     </div>
   );
@@ -605,6 +730,8 @@ export default function App() {
     if (filters.materialSearch) { const q = filters.materialSearch.toUpperCase(); d = d.filter(l => l.material.toUpperCase().includes(q)); }
     if (filters.statusFilter === "open") d = d.filter(l => l.open);
     if (filters.statusFilter === "closed") d = d.filter(l => !l.open && !l.preExisting);
+    if (filters.statusFilter === "depleted") d = d.filter(l => l.exitReason === "depleted");
+    if (filters.statusFilter === "transferred") d = d.filter(l => l.exitReason === "transferred");
     return d;
   }, [costed, filters]);
 
@@ -612,13 +739,13 @@ export default function App() {
     const s = {};
     for (const loc of Object.keys(OCS_LOCATIONS)) {
       const lcs = filtered.filter(l => l.loc === loc); const valid = lcs.filter(l => !l.preExisting && l.dwell != null); const dwells = valid.map(l => l.dwell);
-      s[loc] = { total: lcs.length, valid: valid.length, open: lcs.filter(l => l.open).length, preEx: lcs.filter(l => l.preExisting).length, avgDwell: dwells.length ? dwells.reduce((a, b) => a + b, 0) / dwells.length : null, cost: lcs.reduce((a, l) => a + (l.totalCost || 0), 0), mats: new Set(lcs.map(l => l.material)).size, lcs };
+      s[loc] = { total: lcs.length, valid: valid.length, open: lcs.filter(l => l.open).length, preEx: lcs.filter(l => l.preExisting).length, depleted: lcs.filter(l => l.exitReason === "depleted").length, transferred: lcs.filter(l => l.exitReason === "transferred").length, avgDwell: dwells.length ? dwells.reduce((a, b) => a + b, 0) / dwells.length : null, cost: lcs.reduce((a, l) => a + (l.totalCost || 0), 0), mats: new Set(lcs.map(l => l.material)).size, lcs };
     }
     return s;
   }, [filtered]);
 
   const actLocs = useMemo(() => Object.entries(locStats).filter(([, s]) => s.total > 0).sort((a, b) => b[1].total - a[1].total), [locStats]);
-  const totals = useMemo(() => ({ pallets: actLocs.reduce((s, [, d]) => s + d.total, 0), open: actLocs.reduce((s, [, d]) => s + d.open, 0), cost: actLocs.reduce((s, [, d]) => s + d.cost, 0), preEx: actLocs.reduce((s, [, d]) => s + d.preEx, 0) }), [actLocs]);
+  const totals = useMemo(() => ({ pallets: actLocs.reduce((s, [, d]) => s + d.total, 0), open: actLocs.reduce((s, [, d]) => s + d.open, 0), cost: actLocs.reduce((s, [, d]) => s + d.cost, 0), preEx: actLocs.reduce((s, [, d]) => s + d.preEx, 0), depleted: actLocs.reduce((s, [, d]) => s + d.depleted, 0), transferred: actLocs.reduce((s, [, d]) => s + d.transferred, 0) }), [actLocs]);
   const ohData = useMemo(() => filtered.length ? computeOnHand(filtered, ohGran) : [], [filtered, ohGran]);
   const tpData = useMemo(() => computeThroughput(filtered), [filtered]);
   const clData = useMemo(() => computeCostByLoc(filtered), [filtered]);
@@ -751,7 +878,7 @@ export default function App() {
 
         {tab === "overview" && <>
           <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-            <KPI label="Total Lifecycles" value={fmtN(totals.pallets)} /><KPI label="Open" value={fmtN(totals.open)} color={CV.green} /><KPI label="Pre-existing" value={fmtN(totals.preEx)} color={CV.orange} /><KPI label="Modeled Cost" value={totals.cost > 0 ? fmtK(totals.cost) : "---"} color={CV.red} /><KPI label="Locations" value={actLocs.length} color={CV.teal} />
+            <KPI label="Total Lifecycles" value={fmtN(totals.pallets)} /><KPI label="Open" value={fmtN(totals.open)} color={CV.green} /><KPI label="Depleted" value={fmtN(totals.depleted)} color="#B44" sub="case pick + adj" /><KPI label="Pre-existing" value={fmtN(totals.preEx)} color={CV.orange} /><KPI label="Modeled Cost" value={totals.cost > 0 ? fmtK(totals.cost) : "---"} color={CV.red} /><KPI label="Locations" value={actLocs.length} color={CV.teal} />
           </div>
           {lifecycles?._dedupStats?.totalRemoved > 0 && (() => { const ds = lifecycles._dedupStats; return (
             <div style={{ marginBottom: 16, background: "#fff", borderRadius: 10, padding: "12px 18px", border: `1px solid ${CV.creamDark}`, borderLeft: `3px solid ${CV.teal}`, display: "flex", alignItems: "center", gap: 16, fontSize: 11 }}>
@@ -1029,7 +1156,7 @@ export default function App() {
           <button onClick={() => setDrillMat(null)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: CV.teal, fontWeight: 600, marginBottom: 12, padding: 0 }}>Back</button>
           <h2 style={{ margin: "0 0 16px", fontSize: 18, fontWeight: 800 }}>Material: <span style={{ fontFamily: "monospace" }}>{drillMat}</span></h2>
           <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}><KPI label="Lifecycles" value={fmtN(ml.length)} /><KPI label="Open" value={fmtN(mo.length)} color={CV.green} /><KPI label="Avg Dwell" value={md.length ? `${(md.reduce((a, b) => a + b, 0) / md.length).toFixed(0)}d` : "---"} color={CV.teal} /><KPI label="Cost" value={mc > 0 ? fmtK(mc) : "---"} color={CV.red} /></div>
-          <Card><SectionTitle>Pallet Detail</SectionTitle><div style={{ overflowX: "auto", maxHeight: 500, overflowY: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}><thead><tr style={{ background: CV.navy }}>{["Pallet", "Loc", "Qty", "Entry", "Exit", "Dwell", "Status", "Cost"].map(h => <th key={h} style={{ padding: "8px", textAlign: "left", color: "#fff", fontWeight: 700, fontSize: 9 }}>{h}</th>)}</tr></thead><tbody>{ml.slice(0, 300).map((l, i) => <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : CV.cream }}><td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{l.pallet}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.loc}</td><td style={{ padding: "5px 8px" }}>{l.qty}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.entryDate)}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.exitDate)}</td><td style={{ padding: "5px 8px", fontWeight: 600 }}>{l.dwell != null ? `${l.dwell}d` : "---"}</td><td style={{ padding: "5px 8px" }}>{l.open ? <Badge bg="#E8F8ED" color={CV.green}>Open</Badge> : l.preExisting ? <Badge bg="#FEF3E2" color={CV.orange}>Pre-Ex</Badge> : ""}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.totalCost > 0 ? fmt$(l.totalCost) : "---"}</td></tr>)}</tbody></table></div></Card>
+          <Card><SectionTitle>Pallet Detail</SectionTitle><div style={{ overflowX: "auto", maxHeight: 500, overflowY: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}><thead><tr style={{ background: CV.navy }}>{["Pallet", "Loc", "Qty", "Entry", "Exit", "Dwell", "Status", "Cost"].map(h => <th key={h} style={{ padding: "8px", textAlign: "left", color: "#fff", fontWeight: 700, fontSize: 9 }}>{h}</th>)}</tr></thead><tbody>{ml.slice(0, 300).map((l, i) => <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : CV.cream }}><td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{l.pallet}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.loc}</td><td style={{ padding: "5px 8px" }}>{l.qty}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.entryDate)}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.exitDate)}</td><td style={{ padding: "5px 8px", fontWeight: 600 }}>{l.dwell != null ? `${l.dwell}d` : "---"}</td><td style={{ padding: "5px 8px" }}><StatusBadge lc={l} /></td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.totalCost > 0 ? fmt$(l.totalCost) : "---"}</td></tr>)}</tbody></table></div></Card>
         </>; })()}
 
         {tab === "locations" && !drillLoc && <>
@@ -1053,7 +1180,7 @@ export default function App() {
           <h2 style={{ margin: "0 0 4px", fontSize: 18, fontWeight: 800 }}>Pallet Search</h2>
           <p style={{ margin: "0 0 16px", fontSize: 12, color: "#888" }}>Min 3 chars. Searches unfiltered data.</p>
           <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Pallet, material, or lot..." style={{ width: "100%", maxWidth: 400, padding: "10px 14px", borderRadius: 8, border: `1px solid ${CV.creamDark}`, fontSize: 13, marginBottom: 16, fontFamily: "monospace" }} />
-          {searchRes.length > 0 && <Card style={{ padding: 0, overflow: "hidden" }}><div style={{ padding: "10px 14px", fontSize: 11, color: "#888", borderBottom: `1px solid ${CV.cream}` }}>{searchRes.length >= 500 ? "500+" : searchRes.length} results</div><div style={{ overflowX: "auto", maxHeight: 600, overflowY: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 1000 }}><thead><tr style={{ background: CV.navy }}>{["Pallet", "Loc", "Vendor", "Material", "Lot", "Qty", "Entry", "Exit", "Dwell", "Status", "Cost"].map(h => <th key={h} style={{ padding: "8px", textAlign: "left", color: "#fff", fontWeight: 700, fontSize: 9 }}>{h}</th>)}</tr></thead><tbody>{searchRes.map((l, i) => <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : CV.cream }}><td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{l.pallet}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.loc}</td><td style={{ padding: "5px 8px" }}>{OCS_LOCATIONS[l.loc]?.vendor}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.material}</td><td style={{ padding: "5px 8px", fontFamily: "monospace", fontSize: 10 }}>{l.mfgLot}</td><td style={{ padding: "5px 8px" }}>{l.qty}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.entryDate)}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.exitDate)}</td><td style={{ padding: "5px 8px", fontWeight: 600 }}>{l.dwell != null ? `${l.dwell}d` : "---"}</td><td style={{ padding: "5px 8px" }}>{l.open ? <Badge bg="#E8F8ED" color={CV.green}>Open</Badge> : l.preExisting ? <Badge bg="#FEF3E2" color={CV.orange}>Pre-Ex</Badge> : <Badge bg="#F0F0F0" color="#999">Closed</Badge>}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.totalCost > 0 ? fmt$(l.totalCost) : "---"}</td></tr>)}</tbody></table></div></Card>}
+          {searchRes.length > 0 && <Card style={{ padding: 0, overflow: "hidden" }}><div style={{ padding: "10px 14px", fontSize: 11, color: "#888", borderBottom: `1px solid ${CV.cream}` }}>{searchRes.length >= 500 ? "500+" : searchRes.length} results</div><div style={{ overflowX: "auto", maxHeight: 600, overflowY: "auto" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, minWidth: 1000 }}><thead><tr style={{ background: CV.navy }}>{["Pallet", "Loc", "Vendor", "Material", "Lot", "Qty", "Entry", "Exit", "Dwell", "Status", "Cost"].map(h => <th key={h} style={{ padding: "8px", textAlign: "left", color: "#fff", fontWeight: 700, fontSize: 9 }}>{h}</th>)}</tr></thead><tbody>{searchRes.map((l, i) => <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : CV.cream }}><td style={{ padding: "5px 8px", fontFamily: "monospace", fontWeight: 600 }}>{l.pallet}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.loc}</td><td style={{ padding: "5px 8px" }}>{OCS_LOCATIONS[l.loc]?.vendor}</td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.material}</td><td style={{ padding: "5px 8px", fontFamily: "monospace", fontSize: 10 }}>{l.mfgLot}</td><td style={{ padding: "5px 8px" }}>{l.qty}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.entryDate)}</td><td style={{ padding: "5px 8px", fontSize: 10 }}>{fmtD(l.exitDate)}</td><td style={{ padding: "5px 8px", fontWeight: 600 }}>{l.dwell != null ? `${l.dwell}d` : "---"}</td><td style={{ padding: "5px 8px" }}><StatusBadge lc={l} /></td><td style={{ padding: "5px 8px", fontFamily: "monospace" }}>{l.totalCost > 0 ? fmt$(l.totalCost) : "---"}</td></tr>)}</tbody></table></div></Card>}
           {search.length >= 3 && !searchRes.length && <div style={{ padding: 32, textAlign: "center", color: "#aaa" }}>No results</div>}
         </>}
 
