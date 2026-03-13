@@ -199,10 +199,46 @@ async function parseFileToTransactions(file, setProgress) {
 }
 
 function rebuildFromTransactions(allTx, rates) {
-  const entryMap = {}, cleanTx = [];
-  for (const tx of allTx) { if (tx.event === "entry") { const k = `${tx.pallet}|${tx.loc}|${Math.round(tx.ts.getTime() / 300000)}`; if (!entryMap[k]) entryMap[k] = tx; } else cleanTx.push(tx); }
-  for (const tx of Object.values(entryMap)) cleanTx.push(tx);
-  return computeCosts(buildLifecycles(cleanTx, new Date()), rates);
+  // ── STEP 1: Cross-file entry dedup at DAY level ──
+  // Catches both cross-file overlaps AND STG+BATCH pairs on the same pallet/loc/date.
+  // Prior implementation used 5-minute windows which missed BATCH events 6+ min after STG.
+  const entryMap = {};
+  for (const tx of allTx) {
+    if (tx.event !== "entry") continue;
+    const dayKey = `${tx.pallet}|${tx.loc}|${Math.floor(tx.ts.getTime() / 86400000)}`;
+    if (!entryMap[dayKey]) entryMap[dayKey] = tx;
+    // If collision, keep earliest timestamp (STG typically precedes BATCH)
+    else if (tx.ts < entryMap[dayKey].ts) entryMap[dayKey] = tx;
+  }
+  const dedupedEntries = Object.values(entryMap);
+  const entryDupsRemoved = allTx.filter(t => t.event === "entry").length - dedupedEntries.length;
+
+  // ── STEP 2: Cross-file exit dedup at MINUTE level ──
+  const exitMap = {};
+  for (const tx of allTx) {
+    if (tx.event !== "exit") continue;
+    const minKey = `${tx.pallet}|${tx.loc}|${Math.floor(tx.ts.getTime() / 60000)}`;
+    if (!exitMap[minKey]) exitMap[minKey] = tx;
+  }
+  const dedupedExits = Object.values(exitMap);
+  const exitDupsRemoved = allTx.filter(t => t.event === "exit").length - dedupedExits.length;
+
+  // ── Build lifecycles from clean transactions ──
+  const cleanTx = [...dedupedEntries, ...dedupedExits];
+  const lifecycles = computeCosts(buildLifecycles(cleanTx, new Date()), rates);
+
+  // ── Attach dedup stats to the result for UI display ──
+  lifecycles._dedupStats = {
+    rawEntries: allTx.filter(t => t.event === "entry").length,
+    rawExits: allTx.filter(t => t.event === "exit").length,
+    cleanEntries: dedupedEntries.length,
+    cleanExits: dedupedExits.length,
+    entryDupsRemoved,
+    exitDupsRemoved,
+    totalRemoved: entryDupsRemoved + exitDupsRemoved,
+    phantomsEliminated: entryDupsRemoved, // each removed entry = one fewer potential phantom open record
+  };
+  return lifecycles;
 }
 
 // Analytics
@@ -717,6 +753,15 @@ export default function App() {
           <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
             <KPI label="Total Lifecycles" value={fmtN(totals.pallets)} /><KPI label="Open" value={fmtN(totals.open)} color={CV.green} /><KPI label="Pre-existing" value={fmtN(totals.preEx)} color={CV.orange} /><KPI label="Modeled Cost" value={totals.cost > 0 ? fmtK(totals.cost) : "---"} color={CV.red} /><KPI label="Locations" value={actLocs.length} color={CV.teal} />
           </div>
+          {lifecycles?._dedupStats?.totalRemoved > 0 && (() => { const ds = lifecycles._dedupStats; return (
+            <div style={{ marginBottom: 16, background: "#fff", borderRadius: 10, padding: "12px 18px", border: `1px solid ${CV.creamDark}`, borderLeft: `3px solid ${CV.teal}`, display: "flex", alignItems: "center", gap: 16, fontSize: 11 }}>
+              <span style={{ fontWeight: 700, color: CV.teal, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em", flexShrink: 0 }}>Dedup Active</span>
+              <span style={{ color: "#666" }}>
+                {fmtN(ds.entryDupsRemoved)} duplicate inbound + {fmtN(ds.exitDupsRemoved)} duplicate outbound records removed across {loadedFiles.length} files.
+                {ds.entryDupsRemoved > 0 && ` Prevents ~${fmtN(ds.entryDupsRemoved)} phantom open records from appearing in search and aging.`}
+              </span>
+            </div>
+          ); })()}
           <Card style={{ marginBottom: 16 }}><SectionTitle>Location Summary</SectionTitle><div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
               <thead><tr style={{ background: CV.navy }}>{["Code", "Location", "Vendor", "Total", "Open", "Avg Dwell", "Mats", "Cost", "$/Plt"].map(h => <th key={h} style={{ padding: "9px 10px", textAlign: ["Code", "Location", "Vendor"].includes(h) ? "left" : "right", color: "#fff", fontWeight: 700, fontSize: 10 }}>{h}</th>)}</tr></thead>
